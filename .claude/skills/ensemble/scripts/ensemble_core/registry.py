@@ -37,6 +37,7 @@ def apply_review(
     round_number: int,
     previous_hashes: dict[str, str],
     current_hashes: dict[str, str],
+    source: str | None = None,
 ) -> dict[str, Any]:
     registry = load_registry(run_dir)
     new_ids: list[str] = []
@@ -62,6 +63,7 @@ def apply_review(
                 "supersedes": [],
                 "split_from": issue.get("split_from"),
                 "merged_from": issue.get("merged_from", []),
+                "first_seen_source": source,
             }
         entry = registry[issue_id]
         previous_status = entry.get("status")
@@ -73,8 +75,10 @@ def apply_review(
                 "gating": True,
                 "criterion_id": issue["criterion_id"],
                 "section_ref": issue["location"],
+                "evidence_refs": issue["evidence_refs"],
                 "latest_issue": issue,
                 "last_seen_round": round_number,
+                "last_seen_source": source,
             }
         )
         entry["severity_history"].append(
@@ -136,6 +140,7 @@ def write_reviewer_projection(run_dir: Path, registry: dict[str, Any] | None = N
                 "id": issue_id,
                 "status": issue.get("status"),
                 "section_ref": issue.get("section_ref"),
+                "evidence_refs": issue.get("evidence_refs", []),
                 "author_claim": latest_author.get("claim"),
                 "author_evidence_ref": latest_author.get("evidence_ref"),
                 "author_requested_disposition": latest_author.get("requested_disposition"),
@@ -214,8 +219,8 @@ def accept_risk(run_dir: Path, *, issue_id: str, note: str, round_number: int) -
     if not draft_path.exists():
         raise StateError(f"Draft round {round_number} does not exist")
     markdown = draft_path.read_text(encoding="utf-8")
-    section_slug = canonical_section_ref(str(latest.get("location", "document")))
-    evidence_refs = [f"drafts/round-{round_number}.md#{section_slug}"]
+    issue_refs = [str(value) for value in latest.get("evidence_refs", [])]
+    evidence_refs = issue_refs or [str(latest.get("location", "document"))]
     accepted_hashes = evidence_ref_hashes(markdown, evidence_refs)
     if any(value is None for value in accepted_hashes.values()):
         raise StateError(
@@ -227,6 +232,7 @@ def accept_risk(run_dir: Path, *, issue_id: str, note: str, round_number: int) -
         violation_evidence=str(latest.get("violation_evidence", "")),
         required_change=str(latest.get("required_change", "")),
         unmatched_salt=issue_id,
+        evidence_refs=evidence_refs,
     )
     snapshot = {
         **latest,

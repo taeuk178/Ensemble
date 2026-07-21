@@ -159,10 +159,17 @@ def refresh_author_dispositions(run_dir: Path, round_number: int) -> None:
     atomic_write_json(run_dir / "convergence.json", convergence)
     if signals:
         manifest = read_json(run_dir / "manifest.json")
-        manifest["state"] = (
-            "ESCALATION_REQUIRED" if str(manifest.get("phase")) == "3" else "USER_DECISION_REQUIRED"
-        )
+        phase_three = str(manifest.get("phase")) == "3"
+        manifest["state"] = "ESCALATION_REQUIRED" if phase_three else "USER_DECISION_REQUIRED"
         manifest["escalation_signals"] = signals
+        if phase_three:
+            pending = set(manifest.get("pending_panel_issue_ids", []))
+            pending.update(
+                str(signal["issue_id"])
+                for signal in signals
+                if signal.get("type") == "AUTHOR_DEADLOCK" and signal.get("issue_id")
+            )
+            manifest["pending_panel_issue_ids"] = sorted(pending)
         atomic_write_json(run_dir / "manifest.json", manifest)
 
 

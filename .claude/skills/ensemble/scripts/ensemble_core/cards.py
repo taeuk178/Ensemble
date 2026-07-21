@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from .errors import SemanticValidationError
-from .hashing import canonical_section_ref, parse_sections
+from .hashing import canonical_section_ref, parse_sections, resolve_ref_slugs
 from .io_utils import atomic_write_text
 from .registry import load_registry
 
@@ -18,12 +18,15 @@ FORBIDDEN_CARD_TERMS = {
 }
 
 
-def _current_section(markdown: str, reference: str) -> str:
-    target = canonical_section_ref(reference)
-    for section in parse_sections(markdown):
-        if section.slug == target:
-            return section.content
-    return "<섹션을 결정적으로 찾을 수 없음>"
+def _current_sections(markdown: str, references: list[str]) -> str:
+    sections = parse_sections(markdown)
+    by_slug = {section.slug: section for section in sections}
+    matched: set[str] = set()
+    for reference in references:
+        matched.update(resolve_ref_slugs(canonical_section_ref(reference), by_slug))
+    if not matched:
+        return "<섹션을 결정적으로 찾을 수 없음>"
+    return "\n\n".join(by_slug[slug].content for slug in sorted(matched))
 
 
 def build_feedback_cards(run_dir: Path, draft_path: Path) -> str:
@@ -37,6 +40,9 @@ def build_feedback_cards(run_dir: Path, draft_path: Path) -> str:
         if not history:
             continue
         author = history[-1]
+        evidence_refs = [str(value) for value in issue.get("evidence_refs", [])]
+        if not evidence_refs and issue.get("section_ref"):
+            evidence_refs = [str(issue["section_ref"])]
         lines.extend(
             [
                 f"## {issue_id} [일반 라운드]",
@@ -45,11 +51,12 @@ def build_feedback_cards(run_dir: Path, draft_path: Path) -> str:
                 f"- 작성자 판단: {author.get('value')}",
                 f"- claim: {author.get('claim')}",
                 f"- evidence_ref: {author.get('evidence_ref')}",
+                f"- draft_evidence_refs: {', '.join(evidence_refs)}",
                 f"- requested_disposition: {author.get('requested_disposition')}",
                 "- 관련 섹션 현재 텍스트:",
                 "",
                 "```markdown",
-                _current_section(markdown, str(issue.get("section_ref", ""))),
+                _current_sections(markdown, evidence_refs),
                 "```",
                 "",
             ]

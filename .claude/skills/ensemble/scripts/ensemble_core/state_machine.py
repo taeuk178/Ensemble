@@ -9,10 +9,13 @@ from .config import (
     DEFAULT_MAX_PANEL_CALLS,
     DEFAULT_MAX_ROUNDS,
     DEFAULT_PANEL_MODEL,
+    DEFAULT_REVIEW_EFFORT,
     DEFAULT_REVIEW_MODEL,
     RUNS_ROOT,
+    PAUSED_STATES,
     TERMINAL_STATES,
 )
+from .environment import ensemble_source_hash, environment_snapshot
 from .errors import InputError, StateError
 from .hashing import evidence_ref_hashes, section_hashes
 from .io_utils import (
@@ -138,13 +141,27 @@ def initialize_run(
         "finished_at": None,
         "termination_reason": None,
         "models": {
-            "codex": {"requested": review_model, "actual": None, "cli_version": None},
+            "codex": {
+                "requested": review_model,
+                "actual": None,
+                "cli_version": None,
+                "requested_reasoning_effort": DEFAULT_REVIEW_EFFORT,
+                "reasoning_effort": None,
+            },
             "gemini": {"requested": panel_model, "actual": None, "cli_version": None},
         },
         "limits": {"review_rounds": max_rounds, "panel_calls": max_panel_calls},
         "retries": {"schema": 0, "semantic": 0, "infra": 0},
         "usage": {},
         "warnings": [],
+        "environment": environment_snapshot(),
+        "provider_calls": [],
+        "retry_events": [],
+        "review_history": [],
+        "user_decisions": [],
+        "pending_user_issue_ids": [],
+        "pending_panel_issue_ids": [],
+        "escalation_signals": [],
     }
     atomic_write_json(run_dir / "manifest.json", manifest, overwrite=False)
     return run_dir
@@ -157,6 +174,176 @@ def update_manifest(run_dir: Path, **changes: Any) -> dict[str, Any]:
     return manifest
 
 
+def assert_run_can_advance(run_dir: Path, action: str) -> dict[str, Any]:
+    manifest = read_json(run_dir / "manifest.json")
+    state = str(manifest.get("state"))
+    if state in PAUSED_STATES:
+        raise StateError(
+            f"{action} 명령을 실행할 수 없습니다. 현재 상태는 {state}이며 명시적인 사용자 결정이 필요합니다.",
+            details={"state": state, "next_command": "resolve-user-decision"},
+        )
+    if state in TERMINAL_STATES:
+        raise StateError(f"{action} 명령을 실행할 수 없습니다. 실행이 {state} 상태로 종료되었습니다.")
+    return manifest
+
+
+def assert_source_unchanged(run_dir: Path) -> None:
+    manifest = read_json(run_dir / "manifest.json")
+    baseline = (manifest.get("environment") or {}).get("ensemble_source_hash")
+    if not baseline:
+        return
+    current = ensemble_source_hash()
+    if current == baseline:
+        return
+    manifest["state"] = "RUN_TAINTED"
+    manifest["termination_reason"] = "Ensemble source changed after the run started"
+    manifest["finished_at"] = utc_now()
+    manifest.setdefault("environment_changes", []).append(
+        {"recorded_at": utc_now(), "expected_source_hash": baseline, "actual_source_hash": current}
+    )
+    atomic_write_json(run_dir / "manifest.json", manifest)
+    raise StateError(
+        "실행 시작 후 Ensemble 코드가 변경되어 재현성을 보장할 수 없습니다. 새 run을 시작해 주세요.",
+        details={"state": "RUN_TAINTED", "expected": baseline, "actual": current},
+    )
+
+
+def record_provider_call(
+    run_dir: Path,
+    *,
+    provider: str,
+    operation: str,
+    result: Any,
+    round_number: int | None = None,
+    outcome: str = "SUCCESS",
+    error: str | None = None,
+) -> None:
+    manifest = read_json(run_dir / "manifest.json")
+    model = manifest.setdefault("models", {}).setdefault(provider, {})
+    model["actual"] = result.model
+    model["cli_version"] = result.version
+    model["command_path"] = result.executable
+    if getattr(result, "reasoning_effort", None):
+        model["reasoning_effort"] = result.reasoning_effort
+    event = {
+        "recorded_at": utc_now(),
+        "provider": provider,
+        "operation": operation,
+        "round": round_number,
+        "model": result.model,
+        "cli_version": result.version,
+        "command_path": result.executable,
+        "reasoning_effort": getattr(result, "reasoning_effort", None),
+        "attempts": result.attempts,
+        "attempt_errors": list(result.attempt_errors),
+        "outcome": outcome,
+    }
+    if error:
+        event["error"] = error
+    manifest.setdefault("provider_calls", []).append(event)
+    for attempt_error in result.attempt_errors:
+        kind = "schema" if attempt_error.get("kind") == "schema" else "infra"
+        manifest.setdefault("retries", {}).setdefault(kind, 0)
+        manifest["retries"][kind] += 1
+    atomic_write_json(run_dir / "manifest.json", manifest)
+
+
+def record_retry_event(
+    run_dir: Path,
+    *,
+    retry_type: str,
+    operation: str,
+    round_number: int | None,
+    attempt: int,
+    error: str,
+) -> None:
+    manifest = read_json(run_dir / "manifest.json")
+    manifest.setdefault("retry_events", []).append(
+        {
+            "recorded_at": utc_now(),
+            "type": retry_type,
+            "operation": operation,
+            "round": round_number,
+            "attempt": attempt,
+            "error": error,
+        }
+    )
+    atomic_write_json(run_dir / "manifest.json", manifest)
+
+
+def record_provider_failure(
+    run_dir: Path,
+    *,
+    operation: str,
+    round_number: int | None,
+    details: dict[str, Any],
+    error: str,
+) -> None:
+    provider = str(details.get("provider") or "codex")
+    manifest = read_json(run_dir / "manifest.json")
+    model = manifest.setdefault("models", {}).setdefault(provider, {})
+    if details.get("model"):
+        model["actual"] = details["model"]
+    if details.get("cli_version"):
+        model["cli_version"] = details["cli_version"]
+    if details.get("command_path"):
+        model["command_path"] = details["command_path"]
+    if details.get("reasoning_effort"):
+        model["reasoning_effort"] = details["reasoning_effort"]
+    manifest.setdefault("provider_calls", []).append(
+        {
+            "recorded_at": utc_now(),
+            "provider": provider,
+            "operation": operation,
+            "round": round_number,
+            "model": details.get("model"),
+            "cli_version": details.get("cli_version"),
+            "command_path": details.get("command_path"),
+            "reasoning_effort": details.get("reasoning_effort"),
+            "attempts": details.get("attempts"),
+            "attempt_errors": details.get("attempt_errors", []),
+            "outcome": "FAILED",
+            "error": error,
+        }
+    )
+    atomic_write_json(run_dir / "manifest.json", manifest)
+
+
+def resolve_user_decision(run_dir: Path, *, action: str, note: str) -> dict[str, Any]:
+    manifest = read_json(run_dir / "manifest.json")
+    from_state = str(manifest.get("state"))
+    if from_state not in PAUSED_STATES:
+        raise StateError(f"현재 상태 {from_state}에는 사용자 결정 재개가 필요하지 않습니다.")
+    if action not in {"REVISE", "CONTINUE"}:
+        raise InputError("재개 action은 REVISE 또는 CONTINUE여야 합니다.")
+    if not note.strip():
+        raise InputError("사용자 결정 메모가 비어 있습니다.")
+    event = {
+        "recorded_at": utc_now(),
+        "from_state": from_state,
+        "action": action,
+        "note": note.strip(),
+        "signals": manifest.get("escalation_signals", []),
+        "pending_issue_ids": manifest.get("pending_user_issue_ids", []),
+    }
+    manifest.setdefault("user_decisions", []).append(event)
+    manifest["state"] = "DRAFT_READY"
+    manifest["escalation_signals"] = []
+    manifest["pending_user_issue_ids"] = []
+    manifest["pending_panel_issue_ids"] = []
+    atomic_write_json(run_dir / "manifest.json", manifest)
+    decisions_path = run_dir / "decisions.md"
+    existing = decisions_path.read_text(encoding="utf-8").rstrip()
+    section = (
+        f"\n\n## 사용자 결정 {event['recorded_at']}\n\n"
+        f"- 이전 상태: {from_state}\n"
+        f"- 결정: {action}\n"
+        f"- 메모: {note.strip()}\n"
+    )
+    atomic_write_text(decisions_path, existing + section)
+    return event
+
+
 def add_manifest_warning(run_dir: Path, warning: str) -> None:
     manifest = read_json(run_dir / "manifest.json")
     if warning not in manifest["warnings"]:
@@ -165,6 +352,7 @@ def add_manifest_warning(run_dir: Path, warning: str) -> None:
 
 
 def register_draft(run_dir: Path, source: Path, round_number: int) -> dict[str, Any]:
+    assert_run_can_advance(run_dir, "save draft")
     if round_number < 0:
         raise InputError("Draft round must be non-negative")
     destination = run_dir / "drafts" / f"round-{round_number}.md"

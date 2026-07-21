@@ -12,6 +12,7 @@ from .io_utils import atomic_write_json, utc_now
 from .providers import run_codex
 from .validation import validate_review_schema
 from .workflow import current_draft
+from .state_machine import record_provider_call
 
 
 def _observation(markdown: str, issue: dict[str, Any], *, blocking: bool, salt: str) -> dict[str, Any]:
@@ -21,6 +22,7 @@ def _observation(markdown: str, issue: dict[str, Any], *, blocking: bool, salt: 
         violation_evidence=issue["violation_evidence"],
         required_change=issue["required_change"],
         unmatched_salt=salt,
+        evidence_refs=issue.get("evidence_refs", []),
     )
     consequence = consequence_fingerprint(issue["implementation_consequence"])
     identity = f"{anchor}|{consequence}"
@@ -91,6 +93,13 @@ def measure_noise(
                 timeout=timeout,
             )
         validate_review_schema(result.payload)
+        record_provider_call(
+            run_dir,
+            provider="codex",
+            operation="measure-noise",
+            round_number=run_index + 1,
+            result=result,
+        )
         observations: list[dict[str, Any]] = []
         for index, item in enumerate(result.payload["blocking_issues"]):
             observations.append(

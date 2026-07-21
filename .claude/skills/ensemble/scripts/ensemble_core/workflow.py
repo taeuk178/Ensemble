@@ -14,7 +14,8 @@ from .hashing import load_hashes_for_round
 from .io_utils import atomic_write_json, atomic_write_text, read_json
 from .providers import ProviderResult, run_codex
 from .registry import apply_review, load_registry
-from .state_machine import register_draft
+from .state_machine import assert_run_can_advance, register_draft
+from .state_machine import record_provider_call, record_retry_event
 from .validation import validate_against_schema, validate_review_semantics
 
 
@@ -109,13 +110,14 @@ def _validate_and_apply_review(
     review: dict[str, Any],
     review_round: int,
     draft_round: int,
+    baseline_draft_round: int,
     output_path: Path,
     allow_rebuttal_similarity: bool = False,
 ) -> dict[str, Any]:
     schema_path = REFERENCE_ROOT / "review.schema.json"
     validate_against_schema(review, schema_path, "review")
     registry = load_registry(run_dir)
-    previous_hashes = load_hashes_for_round(run_dir, draft_round - 1) if draft_round > 0 else {}
+    previous_hashes = load_hashes_for_round(run_dir, baseline_draft_round)
     current_hashes = load_hashes_for_round(run_dir, draft_round)
     allowed_criteria = set(
         re.findall(r"\bAC-\d{2}\b", (run_dir / "rubric.md").read_text(encoding="utf-8"))
@@ -137,6 +139,7 @@ def _validate_and_apply_review(
         round_number=review_round,
         previous_hashes=previous_hashes,
         current_hashes=current_hashes,
+        source=output_path.relative_to(run_dir).as_posix(),
     )
     metrics = record_review_metrics(run_dir, round_number=review_round, stats=stats)
     manifest = read_json(run_dir / "manifest.json")
@@ -144,6 +147,20 @@ def _validate_and_apply_review(
     manifest["last_reviewed_draft_round"] = draft_round
     manifest["last_review_verdict"] = review["verdict"]
     manifest["state"] = review["verdict"]
+    history = [
+        item
+        for item in manifest.get("review_history", [])
+        if int(item.get("review_round", -1)) != review_round
+    ]
+    history.append(
+        {
+            "review_round": review_round,
+            "draft_round": draft_round,
+            "baseline_draft_round": baseline_draft_round,
+            "verdict": review["verdict"],
+        }
+    )
+    manifest["review_history"] = sorted(history, key=lambda item: int(item["review_round"]))
     atomic_write_json(run_dir / "manifest.json", manifest)
     return {"review": str(output_path), "verdict": review["verdict"], "stats": stats, "metrics": metrics}
 
@@ -153,18 +170,28 @@ def ingest_review(
     *,
     review: dict[str, Any],
     review_round: int,
+    draft_round: int | None = None,
     allow_rebuttal_similarity: bool = False,
 ) -> dict[str, Any]:
-    draft_round = review_round - 1
+    assert_run_can_advance(run_dir, "review")
+    manifest = read_json(run_dir / "manifest.json")
+    expected_review_round = int(manifest.get("last_review_round", 0)) + 1
+    if review_round != expected_review_round:
+        raise StateError(
+            f"Expected review round {expected_review_round}, received {review_round}"
+        )
+    draft_round = int(manifest.get("current_round", 0)) if draft_round is None else draft_round
     draft_path = run_dir / "drafts" / f"round-{draft_round}.md"
     if not draft_path.exists():
         raise StateError(f"Review round {review_round} requires {draft_path.name}")
+    baseline_draft_round = int(manifest.get("last_reviewed_draft_round", -1))
     output_path = run_dir / "reviews" / f"round-{review_round}.json"
     return _validate_and_apply_review(
         run_dir,
         review=review,
         review_round=review_round,
         draft_round=draft_round,
+        baseline_draft_round=baseline_draft_round,
         output_path=output_path,
         allow_rebuttal_similarity=allow_rebuttal_similarity,
     )
@@ -174,15 +201,24 @@ def run_review(
     run_dir: Path,
     *,
     review_round: int,
+    draft_round: int | None,
     model: str,
     timeout: int,
     semantic_retries: int = 2,
 ) -> tuple[ProviderResult, dict[str, Any]]:
-    draft_round = review_round - 1
+    assert_run_can_advance(run_dir, "review")
+    manifest = read_json(run_dir / "manifest.json")
+    expected_review_round = int(manifest.get("last_review_round", 0)) + 1
+    if review_round != expected_review_round:
+        raise StateError(
+            f"Expected review round {expected_review_round}, received {review_round}"
+        )
+    draft_round = int(manifest.get("current_round", 0)) if draft_round is None else draft_round
     draft_path = run_dir / "drafts" / f"round-{draft_round}.md"
     if not draft_path.exists():
         raise StateError(f"Review round {review_round} requires {draft_path.name}")
     build_feedback_cards(run_dir, draft_path)
+    baseline_draft_round = int(manifest.get("last_reviewed_draft_round", -1))
     base_prompt = (REFERENCE_ROOT / "reviewer-prompt.md").read_text(encoding="utf-8")
     schema_path = REFERENCE_ROOT / "review.schema.json"
     prompt = base_prompt
@@ -203,6 +239,7 @@ def run_review(
                 review=result.payload,
                 review_round=review_round,
                 draft_round=draft_round,
+                baseline_draft_round=baseline_draft_round,
                 output_path=run_dir / "reviews" / f"round-{review_round}.json",
                 allow_rebuttal_similarity=semantic_attempt >= 2,
             )
@@ -212,13 +249,37 @@ def run_review(
                     if record["round"] == review_round:
                         record["semantic_validation_bypass"].append("response_to_rebuttal_similarity")
                 atomic_write_json(run_dir / "convergence.json", convergence)
+            record_provider_call(
+                run_dir,
+                provider="codex",
+                operation="review",
+                round_number=review_round,
+                result=result,
+            )
             return result, applied
         except (SemanticValidationError, SchemaError) as exc:
             last_error = exc
+            record_provider_call(
+                run_dir,
+                provider="codex",
+                operation="review",
+                round_number=review_round,
+                result=result,
+                outcome="VALIDATION_RETRY",
+                error=exc.message,
+            )
             manifest = read_json(run_dir / "manifest.json")
             key = "semantic" if isinstance(exc, SemanticValidationError) else "schema"
             manifest["retries"][key] += 1
             atomic_write_json(run_dir / "manifest.json", manifest)
+            record_retry_event(
+                run_dir,
+                retry_type=key,
+                operation="review",
+                round_number=review_round,
+                attempt=semantic_attempt + 1,
+                error=exc.message,
+            )
             prompt = (
                 base_prompt
                 + "\n\nYour previous output failed deterministic validation. Correct only these violations:\n"
@@ -229,6 +290,7 @@ def run_review(
 
 
 def promote_final_findings(run_dir: Path) -> dict[str, Any]:
+    assert_run_can_advance(run_dir, "promote-final")
     reconciliation = read_json(run_dir / "final-reconciliation.json", default={})
     findings = reconciliation.get("unaccepted_blocking_findings", [])
     if not findings:
@@ -237,7 +299,8 @@ def promote_final_findings(run_dir: Path) -> dict[str, Any]:
     if int(manifest.get("last_review_round", 0)) >= int(manifest["limits"]["review_rounds"]):
         raise StateError("Cannot promote FINAL_BLIND findings after the review round limit")
     draft_round, _ = current_draft(run_dir)
-    review_round = draft_round + 1
+    review_round = int(manifest.get("last_review_round", 0)) + 1
+    baseline_draft_round = int(manifest.get("last_reviewed_draft_round", -1))
     review = {
         "verdict": "NEEDS_REVISION",
         "summary": "FINAL_BLIND에서 신규·미수용 blocker가 발견되어 일반 루프로 복귀합니다.",
@@ -252,5 +315,6 @@ def promote_final_findings(run_dir: Path) -> dict[str, Any]:
         review=review,
         review_round=review_round,
         draft_round=draft_round,
+        baseline_draft_round=baseline_draft_round,
         output_path=output_path,
     )

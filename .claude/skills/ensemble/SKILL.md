@@ -55,7 +55,9 @@ allowed-tools: Bash(python3 .claude/skills/ensemble/scripts/review.py *)
    python3 .claude/skills/ensemble/scripts/review.py review --run <run> --round 1
    ```
 
-6. `NEEDS_REVISION`이면 모든 이슈에 대해 `decision` 명령으로 `ACCEPT`/`REJECT`/`DEFER`를 기록한다. `ACCEPT`는 draft를 수정하고 다음 번호로 저장한다. `REJECT`는 근거를 명시하며 직접 해결 처리하지 않는다. 사용자 원문이나 자유 서술을 셸 인자에 넣지 말고 아래 객체를 JSON 파일로 저장해 전달한다.
+   `review`의 `--round`는 리뷰 번호다. 기본 검토 대상은 manifest의 최신 draft다. 리뷰 번호와 draft 번호를 같다고 가정하지 않는다. 꼭 필요한 경우에만 `--draft-round <N>`으로 대상을 명시한다.
+
+6. `NEEDS_REVISION`이면 모든 이슈에 대해 `decision` 명령으로 `ACCEPT`/`REJECT`/`DEFER`를 기록한다. `ACCEPT`는 draft를 수정하고 다음 draft 번호로 저장한다. `REJECT`는 근거를 명시하며 draft를 복사하지 않는다. 다음 리뷰는 증가한 리뷰 번호로 같은 최신 draft를 다시 볼 수 있다. 사용자 원문이나 자유 서술을 셸 인자에 넣지 말고 아래 객체를 JSON 파일로 저장해 전달한다.
 
    ```json
    {
@@ -93,7 +95,16 @@ allowed-tools: Bash(python3 .claude/skills/ensemble/scripts/review.py *)
    python3 .claude/skills/ensemble/scripts/review.py finalize --run <run> --status auto
    ```
 
-9. `USER_DECISION_REQUIRED`나 `PANEL_DISSENT`는 자동으로 해결하지 않는다. 사용자의 선택을 받은 뒤 `accept-risk`, 수정 재개, `STABLE_DISSENT`, `CANCELLED` 중 하나를 명시적으로 적용한다.
+9. 매 명령 결과의 `state`를 확인한다. `USER_DECISION_REQUIRED`나 `ESCALATION_REQUIRED`, `PANEL_DISSENT`는 자동으로 해결하지 않는다. 래퍼도 이 상태에서 다음 draft·review를 거부한다. 사용자의 선택을 받은 뒤 `accept-risk`, 명시적 재개, `STABLE_DISSENT`, `CANCELLED` 중 하나를 적용한다.
+
+   수정 또는 추가 검토를 선택했다면 사용자 답변을 메모 파일에 보존하고 재개한다.
+
+   ```bash
+   python3 .claude/skills/ensemble/scripts/review.py resolve-user-decision \
+     --run <run> --action REVISE --note-file <user-decision.txt>
+   ```
+
+   문서 수정 없이 추가 검토를 승인한 경우에는 `--action CONTINUE`를 사용한다.
 
    위험 수용 메모도 파일로 전달한다.
 
@@ -106,3 +117,5 @@ allowed-tools: Bash(python3 .claude/skills/ensemble/scripts/review.py *)
 - `SCHEMA_ERROR`, `SEMANTIC_VALIDATION_ERROR`, `INFRA_ERROR`를 구분해 그대로 보고한다.
 - 반복 상한은 승인으로 취급하지 않고 `ITERATION_LIMIT_REACHED`로 종료한다.
 - FINAL_BLIND 원본은 수정하지 않는다. 수용 위험 대조 결과는 `final-reconciliation.json`에서 확인한다.
+- run의 `timeline.md`는 사람이 읽는 통합 이력이다. 세부 판단의 원본은 `decisions.md`, `reviews/`, `issue-registry.json`을 기준으로 한다.
+- 실행 중 Ensemble 코드가 바뀌어 `RUN_TAINTED`가 되면 기존 run을 재개하지 않고 새 run을 시작한다.

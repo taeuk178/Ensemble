@@ -6,7 +6,7 @@ from typing import Any
 from .bundle import isolated_bundle
 from .config import REFERENCE_ROOT
 from .errors import InputError, SemanticValidationError, StateError
-from .io_utils import atomic_write_json
+from .io_utils import atomic_write_json, read_json
 from .providers import ProviderResult, run_codex
 from .registry import load_registry, write_reviewer_projection
 from .validation import validate_against_schema
@@ -53,6 +53,23 @@ def apply_audit(run_dir: Path, *, round_number: int, payload: dict[str, Any]) ->
     atomic_write_json(output, payload, overwrite=False)
     atomic_write_json(run_dir / "issue-registry.json", registry)
     write_reviewer_projection(run_dir, registry)
+    manifest = read_json(run_dir / "manifest.json")
+    signals = manifest.get("escalation_signals", [])
+    if (
+        str(manifest.get("phase")) == "3"
+        and manifest.get("state") == "ESCALATION_REQUIRED"
+        and any(signal.get("type") == "REVIEWER_STORM" for signal in signals)
+    ):
+        candidates = sorted(
+            item["id"]
+            for item in payload["issues"]
+            if item["validity"] == "VALID_BLOCKER" and item["relation"] == "UNIQUE"
+        )
+        manifest["pending_panel_issue_ids"] = candidates
+        if not candidates:
+            manifest["state"] = "DRAFT_READY"
+            manifest["escalation_signals"] = []
+        atomic_write_json(run_dir / "manifest.json", manifest)
     return {"audit": str(output), "counts": counts}
 
 
@@ -67,8 +84,17 @@ def run_issue_audit(
     issues = _issues_for_round(registry, round_number)
     if not issues:
         raise StateError(f"No new issues found for round {round_number}")
-    current_draft = run_dir / "drafts" / f"round-{round_number - 1}.md"
-    previous_draft = run_dir / "drafts" / f"round-{round_number - 2}.md"
+    manifest = read_json(run_dir / "manifest.json")
+    history = {
+        int(item["review_round"]): int(item["draft_round"])
+        for item in manifest.get("review_history", [])
+    }
+    current_round = history.get(round_number)
+    previous_round = history.get(round_number - 1)
+    if current_round is None or previous_round is None:
+        raise StateError("Issue audit requires recorded current and previous review/draft mappings")
+    current_draft = run_dir / "drafts" / f"round-{current_round}.md"
+    previous_draft = run_dir / "drafts" / f"round-{previous_round}.md"
     if not current_draft.exists() or not previous_draft.exists():
         raise StateError("Issue audit requires current and previous drafts")
     prompt = (REFERENCE_ROOT / "audit-prompt.md").read_text(encoding="utf-8")

@@ -15,6 +15,7 @@ ISSUE_FIELDS = {
     "id",
     "criterion_id",
     "location",
+    "evidence_refs",
     "problem",
     "violation_evidence",
     "implementation_consequence",
@@ -27,7 +28,7 @@ ISSUE_FIELDS = {
     "split_from",
     "merged_from",
 }
-ISSUE_REQUIRED = ISSUE_FIELDS - {"split_from", "merged_from"}
+ISSUE_REQUIRED = ISSUE_FIELDS
 RESOLVED_FIELDS = {
     "id",
     "resolution_basis",
@@ -36,7 +37,7 @@ RESOLVED_FIELDS = {
     "superseded_by",
     "merged_into",
 }
-RESOLVED_REQUIRED = {"id", "resolution_basis", "resolution_reason", "evidence_refs"}
+RESOLVED_REQUIRED = RESOLVED_FIELDS
 REVIEW_FIELDS = {
     "verdict",
     "summary",
@@ -90,6 +91,11 @@ def _issue(issue: Any, context: str) -> None:
         "basis",
     ):
         _string(issue[field], f"{context}.{field}")
+    refs = issue["evidence_refs"]
+    if not isinstance(refs, list) or not refs or not all(
+        isinstance(ref, str) and ref.strip() for ref in refs
+    ):
+        raise SchemaError(f"{context}.evidence_refs must be a non-empty string array")
     severity = issue["severity"]
     if isinstance(severity, bool) or not isinstance(severity, int) or not 1 <= severity <= 5:
         raise SchemaError(f"{context}.severity must be an integer from 1 to 5")
@@ -182,7 +188,7 @@ def validate_audit_schema(payload: dict[str, Any]) -> None:
     if not isinstance(payload["issues"], list):
         raise SchemaError("audit.issues must be an array")
     allowed = {"id", "validity", "origin", "relation", "duplicate_of", "reason"}
-    required = {"id", "validity", "origin", "relation"}
+    required = allowed
     for index, item in enumerate(payload["issues"]):
         if not isinstance(item, dict):
             raise SchemaError(f"audit.issues[{index}] must be an object")

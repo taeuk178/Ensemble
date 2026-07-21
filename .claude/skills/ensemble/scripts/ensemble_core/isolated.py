@@ -35,6 +35,7 @@ def reconcile_final_findings(
             violation_evidence=finding["violation_evidence"],
             required_change=finding["required_change"],
             unmatched_salt=f"final-{index}",
+            evidence_refs=finding.get("evidence_refs", []),
         )
         consequence = consequence_fingerprint(finding["implementation_consequence"])
         candidates: list[str] = []

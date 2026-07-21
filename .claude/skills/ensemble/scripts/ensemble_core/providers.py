@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .config import DEFAULT_TIMEOUT_SECONDS, INFRA_RETRIES
+from .config import DEFAULT_REVIEW_EFFORT, DEFAULT_TIMEOUT_SECONDS, INFRA_RETRIES
 from .errors import InfraError, SchemaError
 from .validation import parse_json_output, validate_against_schema
 
@@ -20,6 +20,15 @@ class ProviderResult:
     stdout: str
     stderr: str
     attempts: int
+    executable: str
+    version: str | None
+    model: str
+    attempt_errors: tuple[dict[str, Any], ...] = ()
+    # What the finished call actually ran with, not a setting. run_codex always
+    # passes its own effort here; run_gemini leaves it None because the Gemini
+    # CLI has no reasoning-effort concept, and recording a value there would be
+    # a false record.
+    reasoning_effort: str | None = None
 
 
 def command_version(command: str) -> str | None:
@@ -40,12 +49,29 @@ def command_version(command: str) -> str | None:
     return output or None
 
 
-def preflight(*, live_codex: bool, model: str, timeout: int = 60) -> dict[str, Any]:
+def preflight(
+    *,
+    live_codex: bool,
+    model: str,
+    timeout: int = 60,
+    effort: str = DEFAULT_REVIEW_EFFORT,
+) -> dict[str, Any]:
     codex_version = command_version("codex")
     gemini_version = command_version("gemini")
+    codex_path = shutil.which("codex")
+    gemini_path = shutil.which("gemini")
     result: dict[str, Any] = {
-        "codex": {"available": codex_version is not None, "version": codex_version},
-        "gemini": {"available": gemini_version is not None, "version": gemini_version},
+        "codex": {
+            "available": codex_version is not None,
+            "version": codex_version,
+            "path": str(Path(codex_path).resolve()) if codex_path else None,
+            "reasoning_effort": effort,
+        },
+        "gemini": {
+            "available": gemini_version is not None,
+            "version": gemini_version,
+            "path": str(Path(gemini_path).resolve()) if gemini_path else None,
+        },
         "jsonschema": {
             "available": importlib.util.find_spec("jsonschema") is not None,
             "fallback": "built-in strict validator",
@@ -62,6 +88,8 @@ def preflight(*, live_codex: bool, model: str, timeout: int = 60) -> dict[str, A
             "--ephemeral",
             "--ignore-user-config",
             "--skip-git-repo-check",
+            "-c",
+            f"model_reasoning_effort={effort}",
             "-m",
             model,
             "--sandbox",
@@ -97,12 +125,16 @@ def run_codex(
     model: str,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
     retries: int = INFRA_RETRIES,
+    effort: str = DEFAULT_REVIEW_EFFORT,
 ) -> ProviderResult:
-    executable = shutil.which("codex")
-    if executable is None:
+    discovered = shutil.which("codex")
+    if discovered is None:
         raise InfraError("Codex CLI is not installed")
+    executable = str(Path(discovered).resolve())
+    version = command_version(executable)
     last_error: dict[str, Any] | None = None
     last_schema_error: SchemaError | None = None
+    attempt_errors: list[dict[str, Any]] = []
     for attempt in range(1, retries + 2):
         with tempfile.NamedTemporaryFile(prefix="ensemble-codex-", suffix=".json", delete=False) as handle:
             output_path = Path(handle.name)
@@ -113,6 +145,8 @@ def run_codex(
                 "--ephemeral",
                 "--ignore-user-config",
                 "--skip-git-repo-check",
+                "-c",
+                f"model_reasoning_effort={effort}",
                 "-C",
                 str(bundle_dir),
                 "-m",
@@ -136,9 +170,11 @@ def run_codex(
                 )
             except subprocess.TimeoutExpired as exc:
                 last_error = {"attempt": attempt, "kind": "timeout", "message": str(exc)}
+                attempt_errors.append(last_error)
                 continue
             except OSError as exc:
                 last_error = {"attempt": attempt, "kind": "os", "message": str(exc)}
+                attempt_errors.append(last_error)
                 continue
             if completed.returncode != 0:
                 last_error = {
@@ -147,10 +183,12 @@ def run_codex(
                     "returncode": completed.returncode,
                     "stderr": completed.stderr[-2000:],
                 }
+                attempt_errors.append(last_error)
                 continue
             raw = output_path.read_text(encoding="utf-8").strip() if output_path.exists() else ""
             if not raw:
                 last_error = {"attempt": attempt, "kind": "empty_output"}
+                attempt_errors.append(last_error)
                 continue
             try:
                 payload = parse_json_output(raw)
@@ -158,16 +196,48 @@ def run_codex(
             except SchemaError as exc:
                 last_schema_error = exc
                 last_error = {"attempt": attempt, "kind": "schema", "message": exc.message}
+                attempt_errors.append(last_error)
                 continue
-            return ProviderResult(payload, completed.stdout, completed.stderr, attempt)
+            return ProviderResult(
+                payload,
+                completed.stdout,
+                completed.stderr,
+                attempt,
+                executable,
+                version,
+                model,
+                tuple(attempt_errors),
+                effort,
+            )
         finally:
             output_path.unlink(missing_ok=True)
     if last_error and last_error.get("kind") == "schema" and last_schema_error is not None:
         raise SchemaError(
             "Codex output failed schema validation after retries",
-            details={"attempts": retries + 1, "last_error": last_schema_error.as_dict()},
+            details={
+                "attempts": retries + 1,
+                "last_error": last_schema_error.as_dict(),
+                "attempt_errors": attempt_errors,
+                "command_path": executable,
+                "cli_version": version,
+                "model": model,
+                "reasoning_effort": effort,
+                "provider": "codex",
+            },
         )
-    raise InfraError("Codex failed after retries", details=last_error)
+    raise InfraError(
+        "Codex failed after retries",
+        details={
+            "attempts": retries + 1,
+            "last_error": last_error,
+            "attempt_errors": attempt_errors,
+            "command_path": executable,
+            "cli_version": version,
+            "model": model,
+            "reasoning_effort": effort,
+            "provider": "codex",
+        },
+    )
 
 
 def run_gemini(
@@ -180,13 +250,16 @@ def run_gemini(
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
     retries: int = INFRA_RETRIES,
 ) -> ProviderResult:
-    executable = shutil.which("gemini")
-    if executable is None:
+    discovered = shutil.which("gemini")
+    if discovered is None:
         raise InfraError("Gemini CLI is not installed")
+    executable = str(Path(discovered).resolve())
+    version = command_version(executable)
     schema = schema_path.read_text(encoding="utf-8")
     full_prompt = f"{prompt}\n\nReturn JSON matching this schema exactly:\n{schema}"
     last_error: dict[str, Any] | None = None
     last_schema_error: SchemaError | None = None
+    attempt_errors: list[dict[str, Any]] = []
     for attempt in range(1, retries + 2):
         command = [
             executable,
@@ -216,6 +289,7 @@ def run_gemini(
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             last_error = {"attempt": attempt, "kind": "infra", "message": str(exc)}
+            attempt_errors.append(last_error)
             continue
         if completed.returncode != 0:
             last_error = {
@@ -224,10 +298,12 @@ def run_gemini(
                 "returncode": completed.returncode,
                 "stderr": completed.stderr[-2000:],
             }
+            attempt_errors.append(last_error)
             continue
         raw = completed.stdout.strip()
         if not raw:
             last_error = {"attempt": attempt, "kind": "empty_output"}
+            attempt_errors.append(last_error)
             continue
         try:
             outer = json.loads(raw)
@@ -238,11 +314,40 @@ def run_gemini(
             last_error = {"attempt": attempt, "kind": "schema", "message": str(exc)}
             if isinstance(exc, SchemaError):
                 last_schema_error = exc
+            attempt_errors.append(last_error)
             continue
-        return ProviderResult(payload, completed.stdout, completed.stderr, attempt)
+        return ProviderResult(
+            payload,
+            completed.stdout,
+            completed.stderr,
+            attempt,
+            executable,
+            version,
+            model,
+            tuple(attempt_errors),
+        )
     if last_error and last_error.get("kind") == "schema":
         raise SchemaError(
             "Gemini output failed schema validation after retries",
-            details={"attempts": retries + 1, "last_error": last_error},
+            details={
+                "attempts": retries + 1,
+                "last_error": last_error,
+                "attempt_errors": attempt_errors,
+                "command_path": executable,
+                "cli_version": version,
+                "model": model,
+                "provider": "gemini",
+            },
         )
-    raise InfraError("Gemini failed after retries", details=last_error)
+    raise InfraError(
+        "Gemini failed after retries",
+        details={
+            "attempts": retries + 1,
+            "last_error": last_error,
+            "attempt_errors": attempt_errors,
+            "command_path": executable,
+            "cli_version": version,
+            "model": model,
+            "provider": "gemini",
+        },
+    )

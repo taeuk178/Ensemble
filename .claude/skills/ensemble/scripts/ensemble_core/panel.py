@@ -11,6 +11,7 @@ from .errors import InfraError, InputError, StateError
 from .io_utils import atomic_write_json, atomic_write_text, read_json
 from .providers import run_codex, run_gemini
 from .registry import load_registry, write_reviewer_projection
+from .state_machine import record_provider_call
 
 
 def run_panel(
@@ -28,9 +29,12 @@ def run_panel(
         raise InputError(f"Unknown issue ID: {issue_id}")
     issue = registry[issue_id]
     author_history = issue.get("author_disposition_history") or []
-    if not author_history or author_history[-1].get("value") != "REJECT":
-        raise StateError("Panel escalation requires an active author REJECT")
     manifest = read_json(run_dir / "manifest.json")
+    pending_panel = set(manifest.get("pending_panel_issue_ids", []))
+    if issue_id not in pending_panel:
+        raise StateError("Panel escalation requires an issue selected by the escalation controller")
+    if not author_history:
+        raise StateError("Panel escalation requires a recorded author disposition")
     panel_count = int(manifest.get("panel_call_count", 0))
     if panel_count >= int(manifest["limits"]["panel_calls"]):
         raise StateError("Panel call limit reached")
@@ -52,6 +56,13 @@ def run_panel(
             model=review_model,
             timeout=timeout,
         )
+        record_provider_call(
+            run_dir,
+            provider="codex",
+            operation="panel-independent",
+            round_number=draft_round,
+            result=gpt,
+        )
         evaluations["gpt"] = gpt.payload
         atomic_write_json(panel_dir / "gpt.json", gpt.payload, overwrite=False)
         try:
@@ -63,7 +74,15 @@ def run_panel(
                 model=panel_model,
                 timeout=timeout,
             )
+            record_provider_call(
+                run_dir,
+                provider="gemini",
+                operation="panel-independent",
+                round_number=draft_round,
+                result=gemini,
+            )
         except InfraError:
+            manifest = read_json(run_dir / "manifest.json")
             issue["status"] = "BILATERAL_DEADLOCK"
             manifest["state"] = "USER_DECISION_REQUIRED"
             pending = set(manifest.get("pending_user_issue_ids", []))
@@ -80,22 +99,39 @@ def run_panel(
         revote_prompt = base_prompt + "\n\nControlled feedback card:\n" + card
         revotes_dir = panel_dir / "revotes"
         revotes_dir.mkdir()
-        gpt_revote = run_codex(
+        gpt_revote_result = run_codex(
             bundle_dir=bundle_dir,
             prompt=revote_prompt,
             schema_path=schema_path,
             schema_kind="panel",
             model=review_model,
             timeout=timeout,
-        ).payload
-        gemini_revote = run_gemini(
+        )
+        record_provider_call(
+            run_dir,
+            provider="codex",
+            operation="panel-revote",
+            round_number=draft_round,
+            result=gpt_revote_result,
+        )
+        gpt_revote = gpt_revote_result.payload
+        gemini_revote_result = run_gemini(
             bundle_dir=bundle_dir,
             prompt=revote_prompt,
             schema_path=schema_path,
             schema_kind="panel",
             model=panel_model,
             timeout=timeout,
-        ).payload
+        )
+        record_provider_call(
+            run_dir,
+            provider="gemini",
+            operation="panel-revote",
+            round_number=draft_round,
+            result=gemini_revote_result,
+        )
+        gemini_revote = gemini_revote_result.payload
+    manifest = read_json(run_dir / "manifest.json")
     atomic_write_json(revotes_dir / "gpt.json", gpt_revote, overwrite=False)
     atomic_write_json(revotes_dir / "gemini.json", gemini_revote, overwrite=False)
     severities = [int(gpt_revote["severity"]), int(gemini_revote["severity"])]
@@ -119,6 +155,15 @@ def run_panel(
         pending = set(manifest.get("pending_user_issue_ids", []))
         pending.discard(issue_id)
         manifest["pending_user_issue_ids"] = sorted(pending)
+    pending_panel = set(manifest.get("pending_panel_issue_ids", []))
+    pending_panel.discard(issue_id)
+    manifest["pending_panel_issue_ids"] = sorted(pending_panel)
+    if outcome != "PANEL_DISSENT":
+        if pending_panel:
+            manifest["state"] = "ESCALATION_REQUIRED"
+        else:
+            manifest["state"] = "NEEDS_REVISION" if outcome == "REVISION_REQUIRED" else "DRAFT_READY"
+            manifest["escalation_signals"] = []
     issue.setdefault("panel_history", []).append(
         {"round": draft_round, "independent": evaluations, "revotes": {"gpt": gpt_revote, "gemini": gemini_revote}, "outcome": outcome}
     )

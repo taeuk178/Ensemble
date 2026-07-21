@@ -16,13 +16,20 @@ from ensemble_core.bundle import isolated_bundle
 from ensemble_core.audit import apply_audit
 from ensemble_core.cards import build_feedback_cards
 from ensemble_core.convergence import refresh_author_dispositions, reproducibility_metrics
-from ensemble_core.errors import InputError, SchemaError, SemanticValidationError
-from ensemble_core.hashing import canonical_issue_key, parse_sections, section_hashes
+from ensemble_core.errors import InputError, SchemaError, SemanticValidationError, StateError
+from ensemble_core.hashing import canonical_issue_key, parse_sections, refs_changed, section_hashes
+from ensemble_core.history import write_timeline
 from ensemble_core.io_utils import parse_answer_section, read_json
 from ensemble_core.isolated import save_final_assessment
 from ensemble_core.registry import accept_risk, load_registry, record_author_decision
 from ensemble_core.report import finalize
-from ensemble_core.state_machine import initialize_run, register_draft
+from ensemble_core.state_machine import (
+    assert_run_can_advance,
+    assert_source_unchanged,
+    initialize_run,
+    register_draft,
+    resolve_user_decision,
+)
 from ensemble_core.validation import validate_review_schema
 from ensemble_core.workflow import ingest_review
 
@@ -32,6 +39,7 @@ def issue(*, issue_id: str | None = None, severity: int = 4, response: str | Non
         "id": issue_id,
         "criterion_id": "AC-02",
         "location": "오류 흐름",
+        "evidence_refs": ["오류 흐름"],
         "problem": "실패 경로가 정의되지 않았다.",
         "violation_evidence": "`오류 흐름` 절에 실패 상태가 없다.",
         "implementation_consequence": "구현자가 실패 상태를 임의로 결정해야 한다.",
@@ -41,6 +49,8 @@ def issue(*, issue_id: str | None = None, severity: int = 4, response: str | Non
         "basis": "DOCUMENT_INTERNAL",
         "verification_required": False,
         "response_to_rebuttal": response,
+        "split_from": None,
+        "merged_from": [],
     }
 
 
@@ -113,6 +123,11 @@ class InputAndHashingTests(unittest.TestCase):
             canonical_issue_key(markdown, right, unmatched_salt="right"),
         )
 
+    def test_number_only_reference_resolves_full_heading(self) -> None:
+        previous = {"2-2-종료-상태": "old"}
+        current = {"2-2-종료-상태": "new"}
+        self.assertTrue(refs_changed(previous, current, ["§2.2"]))
+
     def test_user_original_is_preserved_byte_for_byte(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             runs = Path(temporary) / "runs"
@@ -126,6 +141,29 @@ class InputAndHashingTests(unittest.TestCase):
 
 
 class ValidationTests(unittest.TestCase):
+    def test_structured_output_schemas_require_every_object_property(self) -> None:
+        reference_root = (
+            Path(__file__).resolve().parents[1]
+            / ".claude"
+            / "skills"
+            / "ensemble"
+            / "references"
+        )
+
+        def inspect(value: object, context: str) -> None:
+            if isinstance(value, dict):
+                if value.get("type") == "object" and "properties" in value:
+                    self.assertFalse(value.get("additionalProperties", True), context)
+                    self.assertEqual(set(value["properties"]), set(value.get("required", [])), context)
+                for key, child in value.items():
+                    inspect(child, f"{context}/{key}")
+            elif isinstance(value, list):
+                for index, child in enumerate(value):
+                    inspect(child, f"{context}/{index}")
+
+        for name in ("proposal.schema.json", "review.schema.json", "audit.schema.json", "panel.schema.json"):
+            inspect(json.loads((reference_root / name).read_text(encoding="utf-8")), name)
+
     def test_reviewer_cannot_output_gating(self) -> None:
         payload = review(blockers=[issue()])
         payload["blocking_issues"][0]["gating"] = False
@@ -159,6 +197,16 @@ class ValidationTests(unittest.TestCase):
 
 
 class RegistryAndWorkflowTests(RunCase):
+    def _resolution(self, issue_id: str, basis: str = "REBUTTAL_ACCEPTED") -> dict[str, object]:
+        return {
+            "id": issue_id,
+            "resolution_basis": basis,
+            "resolution_reason": "이전 이슈가 해소됨",
+            "evidence_refs": ["오류 흐름"],
+            "superseded_by": None,
+            "merged_into": None,
+        }
+
     def test_new_issue_gets_wrapper_id_and_projection_hides_scores(self) -> None:
         issue_id = self.first_issue()
         self.assertEqual(issue_id, "R1-I1")
@@ -186,6 +234,8 @@ class RegistryAndWorkflowTests(RunCase):
             "resolution_basis": "EDIT",
             "resolution_reason": "수정됨",
             "evidence_refs": ["drafts/round-1.md#오류-흐름"],
+            "superseded_by": None,
+            "merged_into": None,
         }
         with self.assertRaises(SemanticValidationError):
             ingest_review(self.run, review=review(resolved=[resolution]), review_round=2)
@@ -203,6 +253,8 @@ class RegistryAndWorkflowTests(RunCase):
             "resolution_basis": "EDIT",
             "resolution_reason": "복구 흐름이 추가됨",
             "evidence_refs": ["drafts/round-1.md#오류-흐름"],
+            "superseded_by": None,
+            "merged_into": None,
         }
         result = ingest_review(self.run, review=review(resolved=[resolution]), review_round=2)
         self.assertEqual(result["stats"]["resolved_issue_ids"], [issue_id])
@@ -226,6 +278,34 @@ class RegistryAndWorkflowTests(RunCase):
         self.assertNotIn("severity", card)
         self.assertNotIn("confidence", card)
         self.assertIn("요청 범위 밖이다", card)
+        self.assertIn("## 오류 흐름", card)
+
+    def test_reject_can_be_rereviewed_without_duplicate_draft(self) -> None:
+        issue_id = self.first_issue()
+        record_author_decision(
+            self.run,
+            issue_id=issue_id,
+            round_number=1,
+            disposition="REJECT",
+            author_severity=2,
+            claim="범위 밖",
+            evidence_ref="request.md",
+            requested_disposition="DISMISS",
+            argument="이미 정의됨",
+            action="수정하지 않음",
+        )
+        refresh_author_dispositions(self.run, 1)
+        result = ingest_review(
+            self.run,
+            review=review(
+                blockers=[issue(issue_id=issue_id, response="반박을 검토했으나 유지한다.")]
+            ),
+            review_round=2,
+        )
+        self.assertEqual(result["verdict"], "NEEDS_REVISION")
+        manifest = read_json(self.run / "manifest.json")
+        self.assertEqual(manifest["last_reviewed_draft_round"], 0)
+        self.assertEqual(manifest["review_history"][-1]["draft_round"], 0)
 
     def test_stall_requires_two_unchanged_transitions(self) -> None:
         issue_id = self.first_issue()
@@ -264,6 +344,12 @@ class RegistryAndWorkflowTests(RunCase):
                 action="없음",
             )
             refresh_author_dispositions(self.run, draft_round + 1)
+            if draft_round == 1:
+                resolve_user_decision(
+                    self.run,
+                    action="CONTINUE",
+                    note="정체 신호 검증을 위해 사용자가 계속 진행을 승인함",
+                )
         convergence = read_json(self.run / "convergence.json")
         self.assertFalse(convergence["rounds"][1]["issue_set_stalled"])
         self.assertTrue(convergence["rounds"][2]["issue_set_stalled"])
@@ -307,6 +393,66 @@ class RegistryAndWorkflowTests(RunCase):
         manifest = read_json(self.run / "manifest.json")
         self.assertEqual(manifest["state"], "USER_DECISION_REQUIRED")
         self.assertEqual(manifest["escalation_signals"][0]["type"], "AUTHOR_DEADLOCK")
+        with self.assertRaises(StateError):
+            assert_run_can_advance(self.run, "review")
+        resolved = resolve_user_decision(
+            self.run,
+            action="CONTINUE",
+            note="사용자가 양측 근거를 확인하고 한 번 더 검토하기로 결정함",
+        )
+        self.assertEqual(resolved["from_state"], "USER_DECISION_REQUIRED")
+        self.assertEqual(assert_run_can_advance(self.run, "review")["state"], "DRAFT_READY")
+
+    def test_reviewer_storm_pauses_before_another_draft_or_review(self) -> None:
+        previous_id = self.first_issue()
+        record_author_decision(
+            self.run,
+            issue_id=previous_id,
+            round_number=1,
+            disposition="ACCEPT",
+            author_severity=4,
+            claim="수정 필요",
+            evidence_ref="오류 흐름",
+            requested_disposition="MODIFY",
+            argument="타당함",
+            action="수정",
+        )
+        refresh_author_dispositions(self.run, 1)
+        for review_round in (2, 3):
+            draft_round = review_round - 1
+            source = self.root / f"storm-{draft_round}.md"
+            source.write_text(
+                f"# 스펙\n\n## 오류 흐름\n\n수정 {draft_round}\n",
+                encoding="utf-8",
+            )
+            register_draft(self.run, source, draft_round)
+            result = ingest_review(
+                self.run,
+                review=review(
+                    blockers=[issue()],
+                    resolved=[self._resolution(previous_id)],
+                ),
+                review_round=review_round,
+            )
+            previous_id = result["stats"]["new_issue_ids"][0]
+            record_author_decision(
+                self.run,
+                issue_id=previous_id,
+                round_number=review_round,
+                disposition="ACCEPT",
+                author_severity=4,
+                claim="수정 필요",
+                evidence_ref="오류 흐름",
+                requested_disposition="MODIFY",
+                argument="타당함",
+                action="수정",
+            )
+            refresh_author_dispositions(self.run, review_round)
+        manifest = read_json(self.run / "manifest.json")
+        self.assertEqual(manifest["state"], "USER_DECISION_REQUIRED")
+        self.assertEqual(manifest["escalation_signals"][0]["type"], "REVIEWER_STORM")
+        with self.assertRaises(StateError):
+            assert_run_can_advance(self.run, "review")
 
     def test_issue_audit_merges_duplicate(self) -> None:
         first = self.first_issue()
@@ -320,6 +466,11 @@ class RegistryAndWorkflowTests(RunCase):
         from ensemble_core.io_utils import atomic_write_json
 
         atomic_write_json(self.run / "issue-registry.json", registry)
+        manifest = read_json(self.run / "manifest.json")
+        manifest["phase"] = "3"
+        manifest["state"] = "ESCALATION_REQUIRED"
+        manifest["escalation_signals"] = [{"type": "REVIEWER_STORM", "round": 1}]
+        atomic_write_json(self.run / "manifest.json", manifest)
         payload = {
             "issues": [
                 {
@@ -342,6 +493,9 @@ class RegistryAndWorkflowTests(RunCase):
         }
         apply_audit(self.run, round_number=1, payload=payload)
         self.assertEqual(load_registry(self.run)["R1-I2"]["status"], "MERGED")
+        manifest = read_json(self.run / "manifest.json")
+        self.assertEqual(manifest["pending_panel_issue_ids"], [first])
+        self.assertEqual(manifest["state"], "ESCALATION_REQUIRED")
 
 
 class AcceptedRiskTests(RunCase):
@@ -411,6 +565,22 @@ class BundleAndReportTests(RunCase):
         with self.assertRaises(StateError):
             save_artifact(self.run, kind="request", source=structured)
 
+    def test_source_change_marks_run_tainted(self) -> None:
+        with patch(
+            "ensemble_core.state_machine.ensemble_source_hash",
+            return_value="changed-source-hash",
+        ):
+            with self.assertRaises(StateError):
+                assert_source_unchanged(self.run)
+        self.assertEqual(read_json(self.run / "manifest.json")["state"], "RUN_TAINTED")
+
+    def test_timeline_summarizes_review_and_draft_mapping(self) -> None:
+        ingest_review(self.run, review=review(), review_round=1)
+        path = write_timeline(self.run)
+        rendered = path.read_text(encoding="utf-8")
+        self.assertIn("리뷰 1 · 초안 0", rendered)
+        self.assertIn("`APPROVED`", rendered)
+
 
 class ReproducibilityTests(unittest.TestCase):
     def test_jaccard_metrics(self) -> None:
@@ -446,6 +616,8 @@ class ProviderCommandTests(unittest.TestCase):
             captured: dict[str, object] = {}
 
             def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
+                if "--version" in command:
+                    return SimpleNamespace(returncode=0, stdout="codex-cli test", stderr="")
                 captured["command"] = command
                 captured["input"] = kwargs.get("input")
                 output = Path(command[command.index("--output-last-message") + 1])
@@ -470,6 +642,31 @@ class ProviderCommandTests(unittest.TestCase):
             self.assertIn("read-only", command)
             self.assertEqual(captured["input"], "PROMPT")
             self.assertEqual(result.payload, payload)
+            self.assertIn("model_reasoning_effort=high", command)
+            self.assertEqual(result.reasoning_effort, "high")
+
+    def test_provider_call_records_reasoning_effort_in_manifest(self) -> None:
+        from ensemble_core.state_machine import record_provider_call
+
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = Path(temporary)
+            (run_dir / "manifest.json").write_text(
+                json.dumps({"models": {"codex": {"requested": "test-model"}}}),
+                encoding="utf-8",
+            )
+            result = SimpleNamespace(
+                model="test-model",
+                version="codex-cli test",
+                executable="/fake/codex",
+                attempts=1,
+                attempt_errors=(),
+                reasoning_effort="high",
+            )
+            record_provider_call(run_dir, provider="codex", operation="review", result=result)
+            manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(manifest["models"]["codex"]["reasoning_effort"], "high")
+        self.assertEqual(manifest["provider_calls"][0]["reasoning_effort"], "high")
 
 
 if __name__ == "__main__":

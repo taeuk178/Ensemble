@@ -11,12 +11,14 @@ from ensemble_core.config import (
     DEFAULT_MAX_PANEL_CALLS,
     DEFAULT_MAX_ROUNDS,
     DEFAULT_PANEL_MODEL,
+    DEFAULT_REVIEW_EFFORT,
     DEFAULT_REVIEW_MODEL,
     DEFAULT_TIMEOUT_SECONDS,
 )
 from ensemble_core.audit import apply_audit, run_issue_audit
 from ensemble_core.convergence import refresh_author_dispositions, reproducibility_metrics
 from ensemble_core.errors import EnsembleError, InfraError, InputError, SchemaError
+from ensemble_core.history import write_timeline
 from ensemble_core.io_utils import (
     detect_sensitive_text,
     parse_answer_section,
@@ -27,10 +29,19 @@ from ensemble_core.io_utils import (
 from ensemble_core.isolated import run_final_blind, save_final_assessment
 from ensemble_core.noise import measure_noise
 from ensemble_core.panel import run_panel
-from ensemble_core.providers import command_version, preflight
+from ensemble_core.providers import preflight
 from ensemble_core.registry import accept_risk, load_registry, record_author_decision
 from ensemble_core.report import finalize
-from ensemble_core.state_machine import initialize_run, mark_terminal, update_manifest
+from ensemble_core.state_machine import (
+    assert_run_can_advance,
+    assert_source_unchanged,
+    initialize_run,
+    mark_terminal,
+    record_provider_call,
+    record_provider_failure,
+    record_retry_event,
+    resolve_user_decision,
+)
 from ensemble_core.workflow import (
     current_draft,
     ingest_review,
@@ -102,8 +113,11 @@ def command_init(args: argparse.Namespace) -> dict[str, Any]:
         allow_reuse=args.allow_reuse,
     )
     manifest = read_json(run_dir / "manifest.json")
-    manifest["models"]["codex"]["cli_version"] = command_version("codex")
-    manifest["models"]["gemini"]["cli_version"] = command_version("gemini")
+    environment = manifest.get("environment", {})
+    for provider in ("codex", "gemini"):
+        info = environment.get(provider, {})
+        manifest["models"][provider]["cli_version"] = info.get("version")
+        manifest["models"][provider]["command_path"] = info.get("path")
     if manifest["models"]["gemini"]["cli_version"] is None:
         manifest["warnings"].append(
             "Gemini CLI unavailable; panel escalation will require user decision"
@@ -128,11 +142,19 @@ def command_preflight(args: argparse.Namespace) -> dict[str, Any]:
     else:
         run_dir = None
         review_model = args.model or DEFAULT_REVIEW_MODEL
-    result = preflight(live_codex=args.live, model=review_model, timeout=args.timeout)
+    result = preflight(
+        live_codex=args.live,
+        model=review_model,
+        timeout=args.timeout,
+        effort=DEFAULT_REVIEW_EFFORT,
+    )
     if run_dir:
         manifest = read_json(run_dir / "manifest.json")
         manifest["models"]["codex"]["cli_version"] = result["codex"]["version"]
+        manifest["models"]["codex"]["command_path"] = result["codex"]["path"]
+        manifest["models"]["codex"]["requested_reasoning_effort"] = result["codex"]["reasoning_effort"]
         manifest["models"]["gemini"]["cli_version"] = result["gemini"]["version"]
+        manifest["models"]["gemini"]["command_path"] = result["gemini"]["path"]
         from ensemble_core.io_utils import atomic_write_json
 
         atomic_write_json(run_dir / "manifest.json", manifest)
@@ -140,8 +162,10 @@ def command_preflight(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def command_save(args: argparse.Namespace) -> dict[str, Any]:
+    run_dir = resolve_run(args.run)
+    assert_run_can_advance(run_dir, "save")
     return save_artifact(
-        resolve_run(args.run),
+        run_dir,
         kind=args.kind,
         source=safe_source_file(args.source),
         round_number=args.round,
@@ -150,37 +174,40 @@ def command_save(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_propose(args: argparse.Namespace) -> dict[str, Any]:
     run_dir = resolve_run(args.run)
+    assert_run_can_advance(run_dir, "propose")
+    assert_source_unchanged(run_dir)
     if args.input:
         path = save_proposal(run_dir, load_payload(args.input))
         return {"proposal": str(path), "source": "ingested"}
     review_model, _ = manifest_models(run_dir, args)
     result, path = run_proposal(run_dir, model=review_model, timeout=args.timeout)
+    record_provider_call(run_dir, provider="codex", operation="proposal", result=result)
     return {"proposal": str(path), "source": "codex", "attempts": result.attempts}
 
 
 def command_review(args: argparse.Namespace) -> dict[str, Any]:
     run_dir = resolve_run(args.run)
+    assert_run_can_advance(run_dir, "review")
+    assert_source_unchanged(run_dir)
     manifest = read_json(run_dir / "manifest.json")
     if manifest.get("phase") == "1A" and args.round != 1:
         raise InputError("Phase 1A supports exactly one normal review round")
     if args.round > int(manifest["limits"]["review_rounds"]):
-        update_manifest(
-            run_dir,
-            state="ITERATION_LIMIT_REACHED",
-            termination_reason="Review round limit reached",
-        )
+        mark_terminal(run_dir, "ITERATION_LIMIT_REACHED", "Review round limit reached")
         raise InputError("Review round exceeds configured limit")
     if args.input:
         return ingest_review(
             run_dir,
             review=load_payload(args.input),
             review_round=args.round,
+            draft_round=args.draft_round,
             allow_rebuttal_similarity=args.allow_rebuttal_similarity,
         )
     review_model, _ = manifest_models(run_dir, args)
     result, applied = run_review(
         run_dir,
         review_round=args.round,
+        draft_round=args.draft_round,
         model=review_model,
         timeout=args.timeout,
     )
@@ -257,6 +284,8 @@ def command_accept_risk(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_final_blind(args: argparse.Namespace) -> dict[str, Any]:
     run_dir = resolve_run(args.run)
+    assert_run_can_advance(run_dir, "final-blind")
+    assert_source_unchanged(run_dir)
     _, draft_path = current_draft(run_dir)
     if args.input:
         reconciliation = save_final_assessment(
@@ -271,19 +300,32 @@ def command_final_blind(args: argparse.Namespace) -> dict[str, Any]:
         model=review_model,
         timeout=args.timeout,
     )
+    record_provider_call(
+        run_dir,
+        provider="codex",
+        operation="final-blind",
+        round_number=int(read_json(run_dir / "manifest.json").get("current_round", 0)),
+        result=result,
+    )
     reconciliation["provider_attempts"] = result.attempts
     reconciliation["source"] = "codex"
     return reconciliation
 
 
 def command_promote_final(args: argparse.Namespace) -> dict[str, Any]:
-    return promote_final_findings(resolve_run(args.run))
+    run_dir = resolve_run(args.run)
+    assert_run_can_advance(run_dir, "promote-final")
+    return promote_final_findings(run_dir)
 
 
 def command_panel(args: argparse.Namespace) -> dict[str, Any]:
     run_dir = resolve_run(args.run)
-    if read_json(run_dir / "manifest.json").get("phase") != "3":
+    manifest = read_json(run_dir / "manifest.json")
+    if manifest.get("phase") != "3":
         raise InputError("Panel evaluation is available only in phase 3")
+    if manifest.get("state") != "ESCALATION_REQUIRED":
+        raise InputError("Panel evaluation requires ESCALATION_REQUIRED state")
+    assert_source_unchanged(run_dir)
     review_model, panel_model = manifest_models(run_dir, args)
     return run_panel(
         run_dir,
@@ -316,7 +358,21 @@ def command_status(args: argparse.Namespace) -> dict[str, Any]:
         "accepted_risks": [issue_id for issue_id, issue in registry.items() if issue.get("status") == "ACCEPTED_RISK"],
         "issue_set_stalled_rounds": [record["round"] for record in convergence["rounds"] if record.get("issue_set_stalled")],
         "warnings": manifest.get("warnings", []),
+        "escalation_signals": manifest.get("escalation_signals", []),
+        "pending_panel_issue_ids": manifest.get("pending_panel_issue_ids", []),
+        "timeline": str(run_dir / "timeline.md"),
     }
+
+
+def command_timeline(args: argparse.Namespace) -> dict[str, Any]:
+    run_dir = resolve_run(args.run)
+    return {"timeline": str(write_timeline(run_dir))}
+
+
+def command_resolve_user_decision(args: argparse.Namespace) -> dict[str, Any]:
+    run_dir = resolve_run(args.run)
+    note = safe_source_file(args.note_file).read_text(encoding="utf-8").strip()
+    return resolve_user_decision(run_dir, action=args.action, note=note)
 
 
 def command_fixture_metrics(args: argparse.Namespace) -> dict[str, Any]:
@@ -328,6 +384,7 @@ def command_fixture_metrics(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_measure_noise(args: argparse.Namespace) -> dict[str, Any]:
     run_dir = resolve_run(args.run)
+    assert_source_unchanged(run_dir)
     review_model, _ = manifest_models(run_dir, args)
     return measure_noise(
         run_dir,
@@ -341,6 +398,7 @@ def command_issue_audit(args: argparse.Namespace) -> dict[str, Any]:
     run_dir = resolve_run(args.run)
     if read_json(run_dir / "manifest.json").get("phase") != "3":
         raise InputError("ISSUE_AUDIT is available only in phase 3")
+    assert_source_unchanged(run_dir)
     if args.input:
         return apply_audit(run_dir, round_number=args.round, payload=load_payload(args.input))
     review_model, _ = manifest_models(run_dir, args)
@@ -349,6 +407,13 @@ def command_issue_audit(args: argparse.Namespace) -> dict[str, Any]:
         round_number=args.round,
         model=review_model,
         timeout=args.timeout,
+    )
+    record_provider_call(
+        run_dir,
+        provider="codex",
+        operation="issue-audit",
+        round_number=args.round,
+        result=result,
     )
     applied["provider_attempts"] = result.attempts
     return applied
@@ -396,6 +461,7 @@ def build_parser() -> argparse.ArgumentParser:
     review = subparsers.add_parser("review")
     review.add_argument("--run", required=True)
     review.add_argument("--round", type=int, required=True)
+    review.add_argument("--draft-round", type=int)
     review.add_argument("--input")
     review.add_argument("--model")
     review.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS)
@@ -413,6 +479,12 @@ def build_parser() -> argparse.ArgumentParser:
     risk.add_argument("--round", type=int, required=True)
     risk.add_argument("--note-file", required=True)
     risk.set_defaults(func=command_accept_risk)
+
+    resolve = subparsers.add_parser("resolve-user-decision")
+    resolve.add_argument("--run", required=True)
+    resolve.add_argument("--action", choices=["REVISE", "CONTINUE"], required=True)
+    resolve.add_argument("--note-file", required=True)
+    resolve.set_defaults(func=command_resolve_user_decision)
 
     final_blind = subparsers.add_parser("final-blind")
     final_blind.add_argument("--run", required=True)
@@ -448,6 +520,7 @@ def build_parser() -> argparse.ArgumentParser:
             "PROTOTYPE_INCOMPLETE",
             "ITERATION_LIMIT_REACHED",
             "INFRA_ERROR",
+            "RUN_TAINTED",
         ],
     )
     finish.set_defaults(func=command_finalize)
@@ -455,6 +528,10 @@ def build_parser() -> argparse.ArgumentParser:
     status = subparsers.add_parser("status")
     status.add_argument("--run", required=True)
     status.set_defaults(func=command_status)
+
+    timeline = subparsers.add_parser("timeline")
+    timeline.add_argument("--run", required=True)
+    timeline.set_defaults(func=command_timeline)
 
     metrics = subparsers.add_parser("fixture-metrics")
     metrics.add_argument("--input", required=True)
@@ -481,7 +558,13 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     try:
-        emit(args.func(args))
+        result = args.func(args)
+        run_value = getattr(args, "run", None)
+        if args.command == "init":
+            write_timeline(Path(result["run_dir"]))
+        elif run_value and args.command not in {"status", "timeline", "fixture-metrics"}:
+            write_timeline(resolve_run(run_value))
+        emit(result)
         return 0
     except EnsembleError as exc:
         run_value = getattr(args, "run", None)
@@ -491,12 +574,31 @@ def main() -> int:
                 manifest = read_json(run_dir / "manifest.json")
                 if isinstance(exc.details, dict) and isinstance(exc.details.get("attempts"), int):
                     retry_key = "schema" if isinstance(exc, SchemaError) else "infra"
-                    manifest["retries"][retry_key] += int(exc.details["attempts"])
+                    retry_count = max(int(exc.details["attempts"]) - 1, 0)
+                    manifest["retries"][retry_key] += retry_count
                     from ensemble_core.io_utils import atomic_write_json
 
                     atomic_write_json(run_dir / "manifest.json", manifest)
+                    record_retry_event(
+                        run_dir,
+                        retry_type=retry_key,
+                        operation=str(getattr(args, "command", "unknown")),
+                        round_number=getattr(args, "round", None),
+                        attempt=int(exc.details["attempts"]),
+                        error=exc.message,
+                    )
+                    record_provider_failure(
+                        run_dir,
+                        operation=str(getattr(args, "command", "unknown")),
+                        round_number=getattr(args, "round", None),
+                        details=exc.details,
+                        error=exc.message,
+                    )
                 if isinstance(exc, InfraError):
-                    mark_terminal(run_dir, "INFRA_ERROR", exc.message)
+                    current = read_json(run_dir / "manifest.json")
+                    if current.get("state") != "USER_DECISION_REQUIRED":
+                        mark_terminal(run_dir, "INFRA_ERROR", exc.message)
+                write_timeline(run_dir)
             except EnsembleError:
                 pass
         emit(exc.as_dict())
