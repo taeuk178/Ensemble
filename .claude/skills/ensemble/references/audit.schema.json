@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["issues"],
+  "properties": {
+    "issues": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "validity", "origin", "relation"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^R[0-9]+-I[0-9]+$"},
+          "validity": {"enum": ["VALID_BLOCKER", "NOT_BLOCKER", "UNVERIFIED"]},
+          "origin": {"enum": ["PRE_EXISTING", "REGRESSION", "UNKNOWN"]},
+          "relation": {"enum": ["UNIQUE", "DUPLICATE"]},
+          "duplicate_of": {"type": ["string", "null"], "pattern": "^R[0-9]+-I[0-9]+$"},
+          "reason": {"type": "string"}
+        }
+      }
+    }
+  }
+}
