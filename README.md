@@ -58,6 +58,8 @@ python3 .claude/skills/ensemble/scripts/review.py finalize --run <run_dir> --sta
 
 검토 번호와 초안 번호는 별개입니다. 문서를 고치지 않았다면 새 초안을 만들지 않고 다음 검토 번호로 최신 초안을 다시 검토합니다. 특정 초안을 지정할 때만 `review --draft-round <N>`을 사용합니다.
 
+일반 검토는 같은 실행의 같은 요청 안에서 하나의 Codex 세션을 이어서 사용합니다. 1차 검토에서 세션을 만들고 다음 검토부터 이전 문답을 이어받습니다. 요청 원문이나 실행 ID가 다르면 세션 재사용을 거부합니다. 제안, 추가 판단, 이슈 점검, 최종 독립 검토는 기존처럼 새 세션에서 실행합니다.
+
 `USER_DECISION_REQUIRED` 또는 `ESCALATION_REQUIRED`가 나오면 작업이 멈추고 사용자 선택을 기다립니다. 선택 내용을 파일로 저장한 뒤 작업을 재개합니다.
 
 ```bash
@@ -78,7 +80,7 @@ python3 .claude/skills/ensemble/scripts/review.py resolve-user-decision \
 | 최종 독립 검토 (`FINAL_BLIND`) | 이전 논의를 숨기고 최종 초안만 새로 검토하는 단계 |
 | 진행을 막는 이슈 (`blocker`) | 해결하거나 사용자가 위험을 받아들여야 다음 단계로 갈 수 있는 문제 |
 | 추가 판단 (`escalation`) | 작성자와 리뷰어가 합의하지 못했을 때 다른 평가를 받는 절차 |
-| 실행 기록 (`manifest.json`) | 상태, 모델, 재시도, 시작·종료 정보를 담은 파일 |
+| 실행 기록 (`manifest.json`) | 상태, 모델, 검토 세션, 재시도, 시작·종료 정보를 담은 파일 |
 
 코드와 JSON에는 호환성을 위해 영문 상태값을 그대로 사용합니다.
 
@@ -98,6 +100,7 @@ python3 .claude/skills/ensemble/scripts/review.py resolve-user-decision \
 ## 안전 규칙
 
 - 일반 검토의 입력 묶음에는 전체 이슈 기록, 작성자 결정, 이전 점수를 넣지 않습니다.
+- 일반 검토 세션은 요청 해시와 실행 ID가 모두 같은 경우에만 이어서 사용합니다.
 - 최종 독립 검토에는 요청, 완료 기준, 최종 초안만 전달합니다.
 - 검토 결과와 초안 사본은 덮어쓰지 않습니다.
 - 최대 반복 횟수에 도달해도 승인으로 처리하지 않습니다.

@@ -156,6 +156,7 @@ def initialize_run(
         "warnings": [],
         "environment": environment_snapshot(),
         "provider_calls": [],
+        "codex_review_session": None,
         "retry_events": [],
         "review_history": [],
         "user_decisions": [],
@@ -172,6 +173,82 @@ def update_manifest(run_dir: Path, **changes: Any) -> dict[str, Any]:
     manifest.update(changes)
     atomic_write_json(run_dir / "manifest.json", manifest)
     return manifest
+
+
+def verified_request_hash(run_dir: Path) -> str:
+    manifest = read_json(run_dir / "manifest.json")
+    original = (run_dir / "request.original.txt").read_text(encoding="utf-8")
+    actual = sha256_text(original)
+    expected = str(manifest.get("request_hash") or "")
+    if not expected or actual != expected:
+        raise StateError("현재 요청이 실행 시작 시 기록한 요청과 다릅니다. 검토 세션을 재사용할 수 없습니다.")
+    return actual
+
+
+def load_codex_review_session(run_dir: Path) -> dict[str, Any] | None:
+    manifest = read_json(run_dir / "manifest.json")
+    request_hash = verified_request_hash(run_dir)
+    session = manifest.get("codex_review_session")
+    if not session:
+        return None
+    if not isinstance(session, dict):
+        raise StateError("Codex 검토 세션 기록 형식이 올바르지 않습니다.")
+    if session.get("request_hash") != request_hash:
+        raise StateError("Codex 검토 세션이 다른 요청에 연결되어 있어 재사용할 수 없습니다.")
+    if session.get("run_id") != manifest.get("run_id"):
+        raise StateError("Codex 검토 세션이 다른 실행에 연결되어 있어 재사용할 수 없습니다.")
+    if session.get("purpose") != "review":
+        raise StateError("Codex 세션의 용도가 일반 검토가 아닙니다.")
+    if not session.get("session_id"):
+        raise StateError("Codex 검토 세션 ID가 비어 있습니다.")
+    return dict(session)
+
+
+def record_codex_review_session(
+    run_dir: Path,
+    *,
+    session_id: str,
+    review_round: int,
+    workspace: Path,
+) -> dict[str, Any]:
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", session_id):
+        raise StateError("Codex 검토 세션 ID 형식이 올바르지 않습니다.")
+    manifest = read_json(run_dir / "manifest.json")
+    request_hash = verified_request_hash(run_dir)
+    workspace_resolved = workspace.resolve()
+    run_resolved = run_dir.resolve()
+    if not workspace_resolved.is_relative_to(run_resolved):
+        raise StateError("Codex 검토 세션 작업 폴더가 현재 실행 밖에 있습니다.")
+    relative_workspace = workspace_resolved.relative_to(run_resolved).as_posix()
+    existing = manifest.get("codex_review_session")
+    if existing:
+        if not isinstance(existing, dict):
+            raise StateError("Codex 검토 세션 기록 형식이 올바르지 않습니다.")
+        if existing.get("request_hash") != request_hash or existing.get("run_id") != manifest.get("run_id"):
+            raise StateError("다른 요청이나 실행의 Codex 세션으로 바꿀 수 없습니다.")
+        if existing.get("session_id") != session_id:
+            raise StateError("검토 도중 Codex 세션 ID가 변경되었습니다.")
+        if existing.get("workspace") != relative_workspace:
+            raise StateError("검토 도중 Codex 세션 작업 폴더가 변경되었습니다.")
+        started_at = existing.get("started_at")
+        first_review_round = existing.get("first_review_round")
+    else:
+        started_at = utc_now()
+        first_review_round = review_round
+    record = {
+        "session_id": session_id,
+        "request_hash": request_hash,
+        "run_id": manifest.get("run_id"),
+        "purpose": "review",
+        "workspace": relative_workspace,
+        "first_review_round": first_review_round,
+        "last_review_round": review_round,
+        "started_at": started_at,
+        "updated_at": utc_now(),
+    }
+    manifest["codex_review_session"] = record
+    atomic_write_json(run_dir / "manifest.json", manifest)
+    return record
 
 
 def assert_run_can_advance(run_dir: Path, action: str) -> dict[str, Any]:
@@ -237,6 +314,8 @@ def record_provider_call(
         "attempts": result.attempts,
         "attempt_errors": list(result.attempt_errors),
         "outcome": outcome,
+        "session_id": getattr(result, "session_id", None),
+        "session_resumed": bool(getattr(result, "session_resumed", False)),
     }
     if error:
         event["error"] = error

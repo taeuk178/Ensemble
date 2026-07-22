@@ -29,6 +29,8 @@ class ProviderResult:
     # CLI has no reasoning-effort concept, and recording a value there would be
     # a false record.
     reasoning_effort: str | None = None
+    session_id: str | None = None
+    session_resumed: bool = False
 
 
 def command_version(command: str) -> str | None:
@@ -116,6 +118,19 @@ def preflight(
     return result
 
 
+def _codex_session_id(stdout: str) -> str | None:
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "thread.started":
+            thread_id = event.get("thread_id")
+            if isinstance(thread_id, str) and thread_id:
+                return thread_id
+    return None
+
+
 def run_codex(
     *,
     bundle_dir: Path,
@@ -126,7 +141,11 @@ def run_codex(
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
     retries: int = INFRA_RETRIES,
     effort: str = DEFAULT_REVIEW_EFFORT,
+    persist_session: bool = False,
+    session_id: str | None = None,
 ) -> ProviderResult:
+    if session_id is not None and not persist_session:
+        raise ValueError("session_id requires persist_session=True")
     discovered = shutil.which("codex")
     if discovered is None:
         raise InfraError("Codex CLI is not installed")
@@ -135,30 +154,53 @@ def run_codex(
     last_error: dict[str, Any] | None = None
     last_schema_error: SchemaError | None = None
     attempt_errors: list[dict[str, Any]] = []
+    active_session_id = session_id
     for attempt in range(1, retries + 2):
         with tempfile.NamedTemporaryFile(prefix="ensemble-codex-", suffix=".json", delete=False) as handle:
             output_path = Path(handle.name)
         try:
-            command = [
-                executable,
-                "exec",
-                "--ephemeral",
-                "--ignore-user-config",
-                "--skip-git-repo-check",
-                "-c",
-                f"model_reasoning_effort={effort}",
-                "-C",
-                str(bundle_dir),
-                "-m",
-                model,
-                "--sandbox",
-                "read-only",
-                "--output-schema",
-                str(schema_path),
-                "--output-last-message",
-                str(output_path),
-                "-",
-            ]
+            resuming = active_session_id is not None
+            if resuming:
+                command = [
+                    executable,
+                    "exec",
+                    "resume",
+                    "--ignore-user-config",
+                    "--skip-git-repo-check",
+                    "-c",
+                    f"model_reasoning_effort={effort}",
+                    "-m",
+                    model,
+                    "--output-schema",
+                    str(schema_path),
+                    "--json",
+                    "--output-last-message",
+                    str(output_path),
+                    active_session_id,
+                    "-",
+                ]
+            else:
+                command = [
+                    executable,
+                    "exec",
+                    *([] if persist_session else ["--ephemeral"]),
+                    "--ignore-user-config",
+                    "--skip-git-repo-check",
+                    "-c",
+                    f"model_reasoning_effort={effort}",
+                    "-C",
+                    str(bundle_dir),
+                    "-m",
+                    model,
+                    "--sandbox",
+                    "read-only",
+                    "--output-schema",
+                    str(schema_path),
+                    *(["--json"] if persist_session else []),
+                    "--output-last-message",
+                    str(output_path),
+                    "-",
+                ]
             try:
                 completed = subprocess.run(
                     command,
@@ -185,6 +227,22 @@ def run_codex(
                 }
                 attempt_errors.append(last_error)
                 continue
+            reported_session_id = _codex_session_id(completed.stdout)
+            if active_session_id is not None and reported_session_id not in (None, active_session_id):
+                last_error = {
+                    "attempt": attempt,
+                    "kind": "session_id_mismatch",
+                    "expected": active_session_id,
+                    "actual": reported_session_id,
+                }
+                attempt_errors.append(last_error)
+                continue
+            if persist_session and active_session_id is None:
+                active_session_id = reported_session_id
+                if active_session_id is None:
+                    last_error = {"attempt": attempt, "kind": "missing_session_id"}
+                    attempt_errors.append(last_error)
+                    continue
             raw = output_path.read_text(encoding="utf-8").strip() if output_path.exists() else ""
             if not raw:
                 last_error = {"attempt": attempt, "kind": "empty_output"}
@@ -199,15 +257,17 @@ def run_codex(
                 attempt_errors.append(last_error)
                 continue
             return ProviderResult(
-                payload,
-                completed.stdout,
-                completed.stderr,
-                attempt,
-                executable,
-                version,
-                model,
-                tuple(attempt_errors),
-                effort,
+                payload=payload,
+                stdout=completed.stdout,
+                stderr=completed.stderr,
+                attempts=attempt,
+                executable=executable,
+                version=version,
+                model=model,
+                attempt_errors=tuple(attempt_errors),
+                reasoning_effort=effort,
+                session_id=active_session_id,
+                session_resumed=resuming,
             )
         finally:
             output_path.unlink(missing_ok=True)
@@ -223,6 +283,8 @@ def run_codex(
                 "model": model,
                 "reasoning_effort": effort,
                 "provider": "codex",
+                "session_id": active_session_id,
+                "persist_session": persist_session,
             },
         )
     raise InfraError(
@@ -236,6 +298,8 @@ def run_codex(
             "model": model,
             "reasoning_effort": effort,
             "provider": "codex",
+            "session_id": active_session_id,
+            "persist_session": persist_session,
         },
     )
 

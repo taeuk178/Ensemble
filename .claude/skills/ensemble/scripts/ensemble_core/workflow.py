@@ -5,7 +5,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .bundle import isolated_bundle
+from .bundle import isolated_bundle, prepare_review_session_bundle
 from .cards import build_feedback_cards
 from .config import REFERENCE_ROOT
 from .convergence import record_review_metrics
@@ -15,7 +15,13 @@ from .io_utils import atomic_write_json, atomic_write_text, read_json
 from .providers import ProviderResult, run_codex
 from .registry import apply_review, load_registry
 from .state_machine import assert_run_can_advance, register_draft
-from .state_machine import record_provider_call, record_retry_event
+from .state_machine import (
+    load_codex_review_session,
+    record_codex_review_session,
+    record_provider_call,
+    record_retry_event,
+    verified_request_hash,
+)
 from .validation import validate_against_schema, validate_review_semantics
 
 
@@ -223,16 +229,34 @@ def run_review(
     schema_path = REFERENCE_ROOT / "review.schema.json"
     prompt = base_prompt
     last_error: SemanticValidationError | SchemaError | None = None
+    request_hash = verified_request_hash(run_dir)
+    review_session = load_codex_review_session(run_dir)
+    session_id = review_session["session_id"] if review_session else None
+    bundle_dir = prepare_review_session_bundle(
+        run_dir,
+        draft_path=draft_path,
+        request_hash=request_hash,
+    )
     for semantic_attempt in range(semantic_retries + 1):
-        with isolated_bundle(run_dir, mode="review", draft_path=draft_path) as bundle_dir:
-            result = run_codex(
-                bundle_dir=bundle_dir,
-                prompt=prompt,
-                schema_path=schema_path,
-                schema_kind="review",
-                model=model,
-                timeout=timeout,
-            )
+        result = run_codex(
+            bundle_dir=bundle_dir,
+            prompt=prompt,
+            schema_path=schema_path,
+            schema_kind="review",
+            model=model,
+            timeout=timeout,
+            persist_session=True,
+            session_id=session_id,
+        )
+        if result.session_id is None:
+            raise StateError("Codex 검토 세션 ID를 확인할 수 없습니다.")
+        record_codex_review_session(
+            run_dir,
+            session_id=result.session_id,
+            review_round=review_round,
+            workspace=bundle_dir,
+        )
+        session_id = result.session_id
         try:
             applied = _validate_and_apply_review(
                 run_dir,

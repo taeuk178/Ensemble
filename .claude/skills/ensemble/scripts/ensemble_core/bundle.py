@@ -36,6 +36,54 @@ def _copy_checked(source: Path, destination: Path, run_dir: Path) -> None:
     shutil.copyfile(resolved, destination)
 
 
+def prepare_review_session_bundle(
+    run_dir: Path,
+    *,
+    draft_path: Path,
+    request_hash: str,
+) -> Path:
+    """Refresh the stable, request-scoped workspace used by a resumed review session."""
+    if len(request_hash) != 64 or any(character not in "0123456789abcdef" for character in request_hash):
+        raise SecurityError("검토 세션의 요청 해시가 올바르지 않습니다.")
+    sessions_dir = run_dir / "review-sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    if sessions_dir.is_symlink():
+        raise SecurityError("검토 세션 폴더는 심볼릭 링크일 수 없습니다.")
+    bundle_dir = sessions_dir / request_hash
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    if bundle_dir.is_symlink() or not bundle_dir.resolve().is_relative_to(run_dir.resolve()):
+        raise SecurityError("검토 세션 작업 폴더가 현재 실행 밖을 가리킵니다.")
+    existing = {path.name for path in bundle_dir.iterdir()}
+    unexpected = existing - REVIEW_BUNDLE_ALLOWLIST
+    if unexpected:
+        raise SecurityError(f"검토 세션 폴더에 허용되지 않은 파일이 있습니다: {sorted(unexpected)}")
+    unsafe = sorted(
+        path.name for path in bundle_dir.iterdir() if path.is_symlink() or not path.is_file()
+    )
+    if unsafe:
+        raise SecurityError(f"검토 세션 폴더에 안전하지 않은 파일이 있습니다: {unsafe}")
+    sources = {
+        "request.md": run_dir / "request.md",
+        "rubric.md": run_dir / "rubric.md",
+        "draft.md": draft_path,
+        "reviewer-issue-index.json": run_dir / "reviewer-issue-index.json",
+        "feedback-cards.md": run_dir / "feedback-cards.md",
+    }
+    for name, source in sources.items():
+        _copy_checked(source, bundle_dir / name, run_dir)
+    audit_path = run_dir / "bundles" / f"{uuid.uuid4().hex}.json"
+    atomic_write_json(
+        audit_path,
+        {
+            "mode": "review-session",
+            "files": sorted(sources),
+            "request_hash": request_hash,
+            "workspace": bundle_dir.relative_to(run_dir).as_posix(),
+        },
+    )
+    return bundle_dir
+
+
 @contextmanager
 def isolated_bundle(
     run_dir: Path,

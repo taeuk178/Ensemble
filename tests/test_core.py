@@ -12,26 +12,30 @@ from unittest.mock import patch
 SCRIPT_ROOT = Path(__file__).resolve().parents[1] / ".claude" / "skills" / "ensemble" / "scripts"
 sys.path.insert(0, str(SCRIPT_ROOT))
 
-from ensemble_core.bundle import isolated_bundle
+from ensemble_core.bundle import isolated_bundle, prepare_review_session_bundle
 from ensemble_core.audit import apply_audit
 from ensemble_core.cards import build_feedback_cards
 from ensemble_core.convergence import refresh_author_dispositions, reproducibility_metrics
-from ensemble_core.errors import InputError, SchemaError, SemanticValidationError, StateError
+from ensemble_core.errors import InputError, SchemaError, SecurityError, SemanticValidationError, StateError
 from ensemble_core.hashing import canonical_issue_key, parse_sections, refs_changed, section_hashes
 from ensemble_core.history import write_timeline
-from ensemble_core.io_utils import parse_answer_section, read_json
+from ensemble_core.io_utils import atomic_write_json, parse_answer_section, read_json
 from ensemble_core.isolated import save_final_assessment
+from ensemble_core.providers import ProviderResult
 from ensemble_core.registry import accept_risk, load_registry, record_author_decision
 from ensemble_core.report import finalize
 from ensemble_core.state_machine import (
     assert_run_can_advance,
     assert_source_unchanged,
     initialize_run,
+    load_codex_review_session,
+    record_codex_review_session,
     register_draft,
     resolve_user_decision,
+    verified_request_hash,
 )
 from ensemble_core.validation import validate_review_schema
-from ensemble_core.workflow import ingest_review
+from ensemble_core.workflow import ingest_review, run_review
 
 
 def issue(*, issue_id: str | None = None, severity: int = 4, response: str | None = None) -> dict[str, object]:
@@ -645,6 +649,72 @@ class ProviderCommandTests(unittest.TestCase):
             self.assertIn("model_reasoning_effort=high", command)
             self.assertEqual(result.reasoning_effort, "high")
 
+    def test_codex_review_session_is_created_then_resumed(self) -> None:
+        from ensemble_core.providers import run_codex
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            schema = root / "proposal.schema.json"
+            schema.write_text(
+                (Path(__file__).resolve().parents[1] / ".claude" / "skills" / "ensemble" / "references" / "proposal.schema.json").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            payload = {
+                "goal": "목표",
+                "sections": [],
+                "requirements": [],
+                "assumptions": [],
+                "risks": [],
+                "user_decisions": [],
+            }
+            commands: list[list[str]] = []
+
+            def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
+                if "--version" in command:
+                    return SimpleNamespace(returncode=0, stdout="codex-cli test", stderr="")
+                commands.append(command)
+                output = Path(command[command.index("--output-last-message") + 1])
+                output.write_text(json.dumps(payload), encoding="utf-8")
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps({"type": "thread.started", "thread_id": "session-123"}),
+                    stderr="",
+                )
+
+            with patch("ensemble_core.providers.shutil.which", return_value="/fake/codex"), patch(
+                "ensemble_core.providers.subprocess.run", side_effect=fake_run
+            ):
+                created = run_codex(
+                    bundle_dir=root,
+                    prompt="ROUND 1",
+                    schema_path=schema,
+                    schema_kind="proposal",
+                    model="test-model",
+                    retries=0,
+                    persist_session=True,
+                )
+                resumed = run_codex(
+                    bundle_dir=root,
+                    prompt="ROUND 2",
+                    schema_path=schema,
+                    schema_kind="proposal",
+                    model="test-model",
+                    retries=0,
+                    persist_session=True,
+                    session_id=created.session_id,
+                )
+
+        self.assertNotIn("--ephemeral", commands[0])
+        self.assertIn("--json", commands[0])
+        self.assertNotIn("resume", commands[0])
+        self.assertEqual(created.session_id, "session-123")
+        self.assertFalse(created.session_resumed)
+        self.assertIn("resume", commands[1])
+        self.assertIn("session-123", commands[1])
+        self.assertNotIn("-C", commands[1])
+        self.assertNotIn("--sandbox", commands[1])
+        self.assertTrue(resumed.session_resumed)
+
     def test_provider_call_records_reasoning_effort_in_manifest(self) -> None:
         from ensemble_core.state_machine import record_provider_call
 
@@ -667,6 +737,87 @@ class ProviderCommandTests(unittest.TestCase):
 
         self.assertEqual(manifest["models"]["codex"]["reasoning_effort"], "high")
         self.assertEqual(manifest["provider_calls"][0]["reasoning_effort"], "high")
+
+
+class ReviewSessionTests(RunCase):
+    def test_review_session_bundle_rejects_allowed_name_symlink(self) -> None:
+        request_hash = verified_request_hash(self.run)
+        workspace = self.run / "review-sessions" / request_hash
+        workspace.mkdir(parents=True)
+        outside = self.root / "outside.md"
+        outside.write_text("보호할 내용", encoding="utf-8")
+        (workspace / "request.md").symlink_to(outside)
+
+        with self.assertRaises(SecurityError):
+            prepare_review_session_bundle(
+                self.run,
+                draft_path=self.run / "drafts" / "round-0.md",
+                request_hash=request_hash,
+            )
+        self.assertEqual(outside.read_text(encoding="utf-8"), "보호할 내용")
+
+    def test_review_session_record_is_scoped_to_the_same_request_and_run(self) -> None:
+        request_hash = verified_request_hash(self.run)
+        workspace = prepare_review_session_bundle(
+            self.run,
+            draft_path=self.run / "drafts" / "round-0.md",
+            request_hash=request_hash,
+        )
+        record_codex_review_session(
+            self.run,
+            session_id="session-123",
+            review_round=1,
+            workspace=workspace,
+        )
+        self.assertEqual(load_codex_review_session(self.run)["session_id"], "session-123")
+
+        manifest = read_json(self.run / "manifest.json")
+        manifest["codex_review_session"]["request_hash"] = "0" * 64
+        atomic_write_json(self.run / "manifest.json", manifest)
+        with self.assertRaises(StateError):
+            load_codex_review_session(self.run)
+
+    def test_review_rounds_resume_the_recorded_session(self) -> None:
+        received_session_ids: list[str | None] = []
+
+        def fake_codex(**kwargs: object) -> ProviderResult:
+            prior_session_id = kwargs.get("session_id")
+            received_session_ids.append(prior_session_id if isinstance(prior_session_id, str) else None)
+            return ProviderResult(
+                payload=review(),
+                stdout="",
+                stderr="",
+                attempts=1,
+                executable="/fake/codex",
+                version="codex-cli test",
+                model="test-model",
+                reasoning_effort="high",
+                session_id="session-123",
+                session_resumed=prior_session_id is not None,
+            )
+
+        with patch("ensemble_core.workflow.run_codex", side_effect=fake_codex):
+            first, _ = run_review(
+                self.run,
+                review_round=1,
+                draft_round=0,
+                model="test-model",
+                timeout=30,
+            )
+            second, _ = run_review(
+                self.run,
+                review_round=2,
+                draft_round=0,
+                model="test-model",
+                timeout=30,
+            )
+
+        self.assertEqual(received_session_ids, [None, "session-123"])
+        self.assertFalse(first.session_resumed)
+        self.assertTrue(second.session_resumed)
+        manifest = read_json(self.run / "manifest.json")
+        self.assertEqual(manifest["codex_review_session"]["last_review_round"], 2)
+        self.assertEqual(manifest["codex_review_session"]["request_hash"], verified_request_hash(self.run))
 
 
 if __name__ == "__main__":
