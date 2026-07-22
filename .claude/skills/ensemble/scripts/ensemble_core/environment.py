@@ -70,5 +70,5 @@ def environment_snapshot() -> dict[str, Any]:
         "git_commit": _git_output("rev-parse", "HEAD"),
         "git_dirty": bool(status) if status is not None else None,
         "codex": command_info("codex"),
-        "gemini": command_info("gemini"),
+        "agy": command_info("agy"),
     }

@@ -10,11 +10,12 @@ REFERENCE_ROOT = SKILL_ROOT / "references"
 RUNS_ROOT = PROJECT_ROOT / "ensemble" / "runs"
 
 DEFAULT_REVIEW_MODEL = os.environ.get("CODEX_REVIEW_MODEL", "gpt-5.6-sol")
-DEFAULT_PANEL_MODEL = os.environ.get("GEMINI_PANEL_MODEL", "gemini-2.5-pro")
+DEFAULT_PANEL_MODEL = os.environ.get("ANTIGRAVITY_PANEL_MODEL", "gemini-3.6-flash-high")
 # Codex runs with --ignore-user-config for reproducibility, so the user's
 # model_reasoning_effort never applies. Without an explicit value the CLI falls
 # back to "none", which is below this model's own default. Set it here instead.
 DEFAULT_REVIEW_EFFORT = os.environ.get("CODEX_REVIEW_EFFORT", "high")
+DEFAULT_PANEL_EFFORT = os.environ.get("ANTIGRAVITY_PANEL_EFFORT", "high")
 DEFAULT_TIMEOUT_SECONDS = 300
 DEFAULT_MAX_ROUNDS = 8
 DEFAULT_MAX_PANEL_CALLS = 3

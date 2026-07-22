@@ -9,7 +9,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .config import DEFAULT_REVIEW_EFFORT, DEFAULT_TIMEOUT_SECONDS, INFRA_RETRIES
+from .config import (
+    DEFAULT_PANEL_EFFORT,
+    DEFAULT_REVIEW_EFFORT,
+    DEFAULT_TIMEOUT_SECONDS,
+    INFRA_RETRIES,
+)
 from .errors import InfraError, SchemaError
 from .validation import parse_json_output, validate_against_schema
 
@@ -24,10 +29,7 @@ class ProviderResult:
     version: str | None
     model: str
     attempt_errors: tuple[dict[str, Any], ...] = ()
-    # What the finished call actually ran with, not a setting. run_codex always
-    # passes its own effort here; run_gemini leaves it None because the Gemini
-    # CLI has no reasoning-effort concept, and recording a value there would be
-    # a false record.
+    # What the finished call actually ran with, not merely a user setting.
     reasoning_effort: str | None = None
     session_id: str | None = None
     session_resumed: bool = False
@@ -57,11 +59,12 @@ def preflight(
     model: str,
     timeout: int = 60,
     effort: str = DEFAULT_REVIEW_EFFORT,
+    panel_effort: str = DEFAULT_PANEL_EFFORT,
 ) -> dict[str, Any]:
     codex_version = command_version("codex")
-    gemini_version = command_version("gemini")
+    agy_version = command_version("agy")
     codex_path = shutil.which("codex")
-    gemini_path = shutil.which("gemini")
+    agy_path = shutil.which("agy")
     result: dict[str, Any] = {
         "codex": {
             "available": codex_version is not None,
@@ -69,10 +72,11 @@ def preflight(
             "path": str(Path(codex_path).resolve()) if codex_path else None,
             "reasoning_effort": effort,
         },
-        "gemini": {
-            "available": gemini_version is not None,
-            "version": gemini_version,
-            "path": str(Path(gemini_path).resolve()) if gemini_path else None,
+        "agy": {
+            "available": agy_version is not None,
+            "version": agy_version,
+            "path": str(Path(agy_path).resolve()) if agy_path else None,
+            "reasoning_effort": panel_effort,
         },
         "jsonschema": {
             "available": importlib.util.find_spec("jsonschema") is not None,
@@ -305,48 +309,54 @@ def run_codex(
     )
 
 
-def run_gemini(
+def _parse_agy_output(raw: str) -> dict[str, Any]:
+    stripped = raw.strip()
+    if stripped.startswith("```") and stripped.endswith("```"):
+        lines = stripped.splitlines()
+        if len(lines) >= 3 and lines[0].strip() in {"```", "```json", "```JSON"}:
+            stripped = "\n".join(lines[1:-1]).strip()
+    return parse_json_output(stripped)
+
+
+def run_agy(
     *,
     bundle_dir: Path,
     prompt: str,
     schema_path: Path,
     schema_kind: str,
     model: str,
+    effort: str = DEFAULT_PANEL_EFFORT,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
     retries: int = INFRA_RETRIES,
 ) -> ProviderResult:
-    discovered = shutil.which("gemini")
+    discovered = shutil.which("agy")
     if discovered is None:
-        raise InfraError("Gemini CLI is not installed")
+        raise InfraError("Antigravity CLI (agy) is not installed")
     executable = str(Path(discovered).resolve())
     version = command_version(executable)
     schema = schema_path.read_text(encoding="utf-8")
     full_prompt = f"{prompt}\n\nReturn JSON matching this schema exactly:\n{schema}"
     last_error: dict[str, Any] | None = None
-    last_schema_error: SchemaError | None = None
     attempt_errors: list[dict[str, Any]] = []
     for attempt in range(1, retries + 2):
         command = [
             executable,
-            "--approval-mode",
-            "plan",
-            "--skip-trust",
-            "--allowed-mcp-server-names",
-            "",
-            "-e",
-            "",
-            "-m",
+            "--model",
             model,
-            "-o",
-            "json",
+            "--effort",
+            effort,
+            "--mode",
+            "plan",
+            "--sandbox",
+            "--print-timeout",
+            f"{timeout}s",
             "-p",
-            "-",
+            full_prompt,
         ]
         try:
             completed = subprocess.run(
                 command,
                 cwd=bundle_dir,
-                input=full_prompt,
                 text=True,
                 capture_output=True,
                 timeout=timeout,
@@ -371,14 +381,10 @@ def run_gemini(
             attempt_errors.append(last_error)
             continue
         try:
-            outer = json.loads(raw)
-            candidate = outer.get("response", outer) if isinstance(outer, dict) else outer
-            payload = candidate if isinstance(candidate, dict) else parse_json_output(str(candidate))
+            payload = _parse_agy_output(raw)
             validate_against_schema(payload, schema_path, schema_kind)
-        except (json.JSONDecodeError, SchemaError) as exc:
+        except SchemaError as exc:
             last_error = {"attempt": attempt, "kind": "schema", "message": str(exc)}
-            if isinstance(exc, SchemaError):
-                last_schema_error = exc
             attempt_errors.append(last_error)
             continue
         return ProviderResult(
@@ -390,10 +396,11 @@ def run_gemini(
             version,
             model,
             tuple(attempt_errors),
+            reasoning_effort=effort,
         )
     if last_error and last_error.get("kind") == "schema":
         raise SchemaError(
-            "Gemini output failed schema validation after retries",
+            "Antigravity output failed schema validation after retries",
             details={
                 "attempts": retries + 1,
                 "last_error": last_error,
@@ -401,11 +408,12 @@ def run_gemini(
                 "command_path": executable,
                 "cli_version": version,
                 "model": model,
-                "provider": "gemini",
+                "provider": "agy",
+                "reasoning_effort": effort,
             },
         )
     raise InfraError(
-        "Gemini failed after retries",
+        "Antigravity CLI failed after retries",
         details={
             "attempts": retries + 1,
             "last_error": last_error,
@@ -413,6 +421,7 @@ def run_gemini(
             "command_path": executable,
             "cli_version": version,
             "model": model,
-            "provider": "gemini",
+            "provider": "agy",
+            "reasoning_effort": effort,
         },
     )

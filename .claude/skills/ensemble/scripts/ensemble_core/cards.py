@@ -72,7 +72,7 @@ def build_feedback_cards(run_dir: Path, draft_path: Path) -> str:
 
 
 def build_panel_card(issue_id: str, evaluations: dict[str, dict[str, Any]], author: dict[str, Any]) -> str:
-    if set(evaluations) != {"gpt", "gemini"}:
+    if set(evaluations) != {"gpt", "agy"}:
         raise SemanticValidationError("Panel card requires all independent evaluations")
     severities = " / ".join(
         f"{name.upper()} {value['severity']}" for name, value in sorted(evaluations.items())

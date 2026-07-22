@@ -44,8 +44,11 @@ def write_timeline(run_dir: Path) -> Path:
             f"- Ensemble 버전 해시: `{environment.get('ensemble_source_hash') or '미기록'}`",
         ]
     )
-    for provider in ("codex", "gemini"):
-        model = manifest.get("models", {}).get(provider, {})
+    models = manifest.get("models", {})
+    for provider in ("codex", "agy"):
+        model = models.get(provider, {})
+        if provider == "agy" and not model:
+            model = models.get("gemini", {})
         lines.append(
             f"- {provider}: `{model.get('actual') or model.get('requested') or '미기록'}` / "
             f"`{model.get('cli_version') or '버전 미기록'}` / `{model.get('command_path') or '경로 미기록'}`"

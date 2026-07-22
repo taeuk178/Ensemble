@@ -9,7 +9,7 @@ from .cards import build_panel_card
 from .config import ISSUE_ID_PATTERN, REFERENCE_ROOT
 from .errors import InfraError, InputError, StateError
 from .io_utils import atomic_write_json, atomic_write_text, read_json
-from .providers import run_codex, run_gemini
+from .providers import run_agy, run_codex
 from .registry import load_registry, write_reviewer_projection
 from .state_machine import record_provider_call
 
@@ -20,6 +20,7 @@ def run_panel(
     issue_id: str,
     review_model: str,
     panel_model: str,
+    panel_effort: str,
     timeout: int,
 ) -> dict[str, Any]:
     if not re.fullmatch(ISSUE_ID_PATTERN, issue_id):
@@ -66,20 +67,21 @@ def run_panel(
         evaluations["gpt"] = gpt.payload
         atomic_write_json(panel_dir / "gpt.json", gpt.payload, overwrite=False)
         try:
-            gemini = run_gemini(
+            agy = run_agy(
                 bundle_dir=bundle_dir,
                 prompt=base_prompt,
                 schema_path=schema_path,
                 schema_kind="panel",
                 model=panel_model,
+                effort=panel_effort,
                 timeout=timeout,
             )
             record_provider_call(
                 run_dir,
-                provider="gemini",
+                provider="agy",
                 operation="panel-independent",
                 round_number=draft_round,
-                result=gemini,
+                result=agy,
             )
         except InfraError:
             manifest = read_json(run_dir / "manifest.json")
@@ -92,8 +94,8 @@ def run_panel(
             atomic_write_json(run_dir / "issue-registry.json", registry)
             atomic_write_json(run_dir / "manifest.json", manifest)
             raise
-        evaluations["gemini"] = gemini.payload
-        atomic_write_json(panel_dir / "gemini.json", gemini.payload, overwrite=False)
+        evaluations["agy"] = agy.payload
+        atomic_write_json(panel_dir / "agy.json", agy.payload, overwrite=False)
         card = build_panel_card(issue_id, evaluations, author_history[-1])
         atomic_write_text(panel_dir / "feedback-card.md", card, overwrite=False)
         revote_prompt = base_prompt + "\n\nControlled feedback card:\n" + card
@@ -115,26 +117,27 @@ def run_panel(
             result=gpt_revote_result,
         )
         gpt_revote = gpt_revote_result.payload
-        gemini_revote_result = run_gemini(
+        agy_revote_result = run_agy(
             bundle_dir=bundle_dir,
             prompt=revote_prompt,
             schema_path=schema_path,
             schema_kind="panel",
             model=panel_model,
+            effort=panel_effort,
             timeout=timeout,
         )
         record_provider_call(
             run_dir,
-            provider="gemini",
+            provider="agy",
             operation="panel-revote",
             round_number=draft_round,
-            result=gemini_revote_result,
+            result=agy_revote_result,
         )
-        gemini_revote = gemini_revote_result.payload
+        agy_revote = agy_revote_result.payload
     manifest = read_json(run_dir / "manifest.json")
     atomic_write_json(revotes_dir / "gpt.json", gpt_revote, overwrite=False)
-    atomic_write_json(revotes_dir / "gemini.json", gemini_revote, overwrite=False)
-    severities = [int(gpt_revote["severity"]), int(gemini_revote["severity"])]
+    atomic_write_json(revotes_dir / "agy.json", agy_revote, overwrite=False)
+    severities = [int(gpt_revote["severity"]), int(agy_revote["severity"])]
     if all(severity <= 2 for severity in severities):
         issue["status"] = "RESOLVED"
         issue["gating"] = False
@@ -165,7 +168,12 @@ def run_panel(
             manifest["state"] = "NEEDS_REVISION" if outcome == "REVISION_REQUIRED" else "DRAFT_READY"
             manifest["escalation_signals"] = []
     issue.setdefault("panel_history", []).append(
-        {"round": draft_round, "independent": evaluations, "revotes": {"gpt": gpt_revote, "gemini": gemini_revote}, "outcome": outcome}
+        {
+            "round": draft_round,
+            "independent": evaluations,
+            "revotes": {"gpt": gpt_revote, "agy": agy_revote},
+            "outcome": outcome,
+        }
     )
     manifest["panel_call_count"] = panel_count + 1
     atomic_write_json(run_dir / "issue-registry.json", registry)

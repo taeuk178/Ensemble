@@ -14,7 +14,7 @@ sys.path.insert(0, str(SCRIPT_ROOT))
 
 from ensemble_core.bundle import isolated_bundle, prepare_review_session_bundle
 from ensemble_core.audit import apply_audit
-from ensemble_core.cards import build_feedback_cards
+from ensemble_core.cards import build_feedback_cards, build_panel_card
 from ensemble_core.convergence import refresh_author_dispositions, reproducibility_metrics
 from ensemble_core.errors import InputError, SchemaError, SecurityError, SemanticValidationError, StateError
 from ensemble_core.hashing import canonical_issue_key, parse_sections, refs_changed, section_hashes
@@ -537,6 +537,13 @@ class AcceptedRiskTests(RunCase):
 
 
 class BundleAndReportTests(RunCase):
+    def test_manifest_uses_agy_panel_provider(self) -> None:
+        models = read_json(self.run / "manifest.json")["models"]
+        self.assertIn("agy", models)
+        self.assertNotIn("gemini", models)
+        self.assertEqual(models["agy"]["requested"], "gemini-3.6-flash-high")
+        self.assertEqual(models["agy"]["requested_reasoning_effort"], "high")
+
     def test_final_bundle_contains_only_blind_inputs(self) -> None:
         with isolated_bundle(
             self.run,
@@ -599,6 +606,77 @@ class ReproducibilityTests(unittest.TestCase):
 
 
 class ProviderCommandTests(unittest.TestCase):
+    def test_legacy_gemini_manifest_record_remains_readable(self) -> None:
+        from review import panel_model_record
+
+        legacy = {"models": {"gemini": {"requested": "legacy-panel-model"}}}
+        self.assertEqual(panel_model_record(legacy)["requested"], "legacy-panel-model")
+
+    def test_agy_invocation_uses_flash_high_plan_sandbox_and_plain_stdout(self) -> None:
+        from ensemble_core.providers import run_agy
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            schema = root / "panel.schema.json"
+            schema.write_text(
+                (
+                    Path(__file__).resolve().parents[1]
+                    / ".claude"
+                    / "skills"
+                    / "ensemble"
+                    / "references"
+                    / "panel.schema.json"
+                ).read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            payload = {
+                "issue_id": "R1-I1",
+                "severity": 4,
+                "confidence": 0.9,
+                "claim": "실패 흐름이 필요합니다.",
+                "evidence_ref": "AC-02",
+                "requested_disposition": "MODIFY",
+            }
+            captured: dict[str, object] = {}
+
+            def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
+                if "--version" in command:
+                    return SimpleNamespace(returncode=0, stdout="1.1.5", stderr="")
+                captured["command"] = command
+                captured["cwd"] = kwargs.get("cwd")
+                captured["input"] = kwargs.get("input")
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=f"```json\n{json.dumps(payload)}\n```\n",
+                    stderr="",
+                )
+
+            with patch("ensemble_core.providers.shutil.which", return_value="/fake/agy"), patch(
+                "ensemble_core.providers.subprocess.run", side_effect=fake_run
+            ):
+                result = run_agy(
+                    bundle_dir=root,
+                    prompt="PROMPT",
+                    schema_path=schema,
+                    schema_kind="panel",
+                    model="gemini-3.6-flash-high",
+                    effort="high",
+                    retries=0,
+                )
+
+        command = captured["command"]
+        self.assertEqual(command[0], "/fake/agy")
+        self.assertEqual(command[command.index("--model") + 1], "gemini-3.6-flash-high")
+        self.assertEqual(command[command.index("--effort") + 1], "high")
+        self.assertEqual(command[command.index("--mode") + 1], "plan")
+        self.assertIn("--sandbox", command)
+        self.assertNotIn("--dangerously-skip-permissions", command)
+        self.assertIn("Return JSON matching this schema exactly", command[command.index("-p") + 1])
+        self.assertEqual(captured["cwd"], root)
+        self.assertIsNone(captured["input"])
+        self.assertEqual(result.payload, payload)
+        self.assertEqual(result.reasoning_effort, "high")
+
     def test_codex_invocation_uses_isolation_flags_and_stdin(self) -> None:
         from ensemble_core.providers import run_codex
 
@@ -742,6 +820,26 @@ class ProviderCommandTests(unittest.TestCase):
 
         self.assertEqual(manifest["models"]["codex"]["reasoning_effort"], "high")
         self.assertEqual(manifest["provider_calls"][0]["reasoning_effort"], "high")
+
+    def test_panel_card_uses_agy_provider_key(self) -> None:
+        assessment = {
+            "severity": 4,
+            "confidence": 0.9,
+            "claim": "검토 필요",
+            "evidence_ref": "AC-02",
+            "requested_disposition": "MODIFY",
+        }
+        card = build_panel_card(
+            "R1-I1",
+            {"gpt": assessment, "agy": assessment},
+            {
+                "value": "REJECT",
+                "claim": "반박",
+                "evidence_ref": "AC-02",
+                "requested_disposition": "DISMISS",
+            },
+        )
+        self.assertIn("AGY 4", card)
 
 
 class ReviewSessionTests(RunCase):

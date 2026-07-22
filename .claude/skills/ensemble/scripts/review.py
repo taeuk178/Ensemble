@@ -10,6 +10,7 @@ from typing import Any
 from ensemble_core.config import (
     DEFAULT_MAX_PANEL_CALLS,
     DEFAULT_MAX_ROUNDS,
+    DEFAULT_PANEL_EFFORT,
     DEFAULT_PANEL_MODEL,
     DEFAULT_REVIEW_EFFORT,
     DEFAULT_REVIEW_MODEL,
@@ -74,11 +75,28 @@ def load_payload(path: str) -> dict[str, Any]:
     return value
 
 
+def panel_model_record(manifest: dict[str, Any]) -> dict[str, Any]:
+    models = manifest.setdefault("models", {})
+    record = models.get("agy") or models.get("gemini")
+    if not isinstance(record, dict):
+        raise InputError("Agy panel model configuration is missing")
+    return record
+
+
 def manifest_models(run_dir: Path, args: argparse.Namespace) -> tuple[str, str]:
     manifest = read_json(run_dir / "manifest.json")
     review_model = getattr(args, "model", None) or manifest["models"]["codex"]["requested"]
-    panel_model = getattr(args, "panel_model", None) or manifest["models"]["gemini"]["requested"]
+    panel_model = getattr(args, "panel_model", None) or panel_model_record(manifest)["requested"]
     return review_model, panel_model
+
+
+def manifest_panel_effort(run_dir: Path, args: argparse.Namespace) -> str:
+    manifest = read_json(run_dir / "manifest.json")
+    return (
+        getattr(args, "panel_effort", None)
+        or panel_model_record(manifest).get("requested_reasoning_effort")
+        or DEFAULT_PANEL_EFFORT
+    )
 
 
 def command_init(args: argparse.Namespace) -> dict[str, Any]:
@@ -108,19 +126,20 @@ def command_init(args: argparse.Namespace) -> dict[str, Any]:
         phase=args.phase,
         review_model=args.model,
         panel_model=args.panel_model,
+        panel_effort=args.panel_effort,
         max_rounds=args.max_rounds,
         max_panel_calls=args.max_panel_calls,
         allow_reuse=args.allow_reuse,
     )
     manifest = read_json(run_dir / "manifest.json")
     environment = manifest.get("environment", {})
-    for provider in ("codex", "gemini"):
+    for provider in ("codex", "agy"):
         info = environment.get(provider, {})
         manifest["models"][provider]["cli_version"] = info.get("version")
         manifest["models"][provider]["command_path"] = info.get("path")
-    if manifest["models"]["gemini"]["cli_version"] is None:
+    if manifest["models"]["agy"]["cli_version"] is None:
         manifest["warnings"].append(
-            "Gemini CLI unavailable; panel escalation will require user decision"
+            "Antigravity CLI (agy) unavailable; panel escalation will require user decision"
         )
     from ensemble_core.io_utils import atomic_write_json
 
@@ -139,22 +158,27 @@ def command_preflight(args: argparse.Namespace) -> dict[str, Any]:
     if args.run:
         run_dir = resolve_run(args.run)
         review_model, _ = manifest_models(run_dir, args)
+        panel_effort = manifest_panel_effort(run_dir, args)
     else:
         run_dir = None
         review_model = args.model or DEFAULT_REVIEW_MODEL
+        panel_effort = args.panel_effort or DEFAULT_PANEL_EFFORT
     result = preflight(
         live_codex=args.live,
         model=review_model,
         timeout=args.timeout,
         effort=DEFAULT_REVIEW_EFFORT,
+        panel_effort=panel_effort,
     )
     if run_dir:
         manifest = read_json(run_dir / "manifest.json")
         manifest["models"]["codex"]["cli_version"] = result["codex"]["version"]
         manifest["models"]["codex"]["command_path"] = result["codex"]["path"]
         manifest["models"]["codex"]["requested_reasoning_effort"] = result["codex"]["reasoning_effort"]
-        manifest["models"]["gemini"]["cli_version"] = result["gemini"]["version"]
-        manifest["models"]["gemini"]["command_path"] = result["gemini"]["path"]
+        agy_model = manifest["models"].setdefault("agy", dict(panel_model_record(manifest)))
+        agy_model["cli_version"] = result["agy"]["version"]
+        agy_model["command_path"] = result["agy"]["path"]
+        agy_model["requested_reasoning_effort"] = panel_effort
         from ensemble_core.io_utils import atomic_write_json
 
         atomic_write_json(run_dir / "manifest.json", manifest)
@@ -327,11 +351,13 @@ def command_panel(args: argparse.Namespace) -> dict[str, Any]:
         raise InputError("Panel evaluation requires ESCALATION_REQUIRED state")
     assert_source_unchanged(run_dir)
     review_model, panel_model = manifest_models(run_dir, args)
+    panel_effort = manifest_panel_effort(run_dir, args)
     return run_panel(
         run_dir,
         issue_id=args.issue,
         review_model=review_model,
         panel_model=panel_model,
+        panel_effort=panel_effort,
         timeout=args.timeout,
     )
 
@@ -431,6 +457,11 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--phase", choices=["1A", "1B", "2", "3"], default="2")
     init.add_argument("--model", default=DEFAULT_REVIEW_MODEL)
     init.add_argument("--panel-model", default=DEFAULT_PANEL_MODEL)
+    init.add_argument(
+        "--panel-effort",
+        choices=["low", "medium", "high"],
+        default=DEFAULT_PANEL_EFFORT,
+    )
     init.add_argument("--max-rounds", type=int, default=DEFAULT_MAX_ROUNDS)
     init.add_argument("--max-panel-calls", type=int, default=DEFAULT_MAX_PANEL_CALLS)
     init.add_argument("--allow-reuse", action="store_true")
@@ -440,6 +471,7 @@ def build_parser() -> argparse.ArgumentParser:
     check = subparsers.add_parser("preflight", help="실행 환경 확인")
     check.add_argument("--run")
     check.add_argument("--model")
+    check.add_argument("--panel-effort", choices=["low", "medium", "high"])
     check.add_argument("--live", action="store_true")
     check.add_argument("--timeout", type=int, default=60)
     check.set_defaults(func=command_preflight)
@@ -502,6 +534,7 @@ def build_parser() -> argparse.ArgumentParser:
     panel.add_argument("--issue", required=True)
     panel.add_argument("--model")
     panel.add_argument("--panel-model")
+    panel.add_argument("--panel-effort", choices=["low", "medium", "high"])
     panel.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS)
     panel.set_defaults(func=command_panel)
 
