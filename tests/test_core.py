@@ -668,11 +668,13 @@ class ProviderCommandTests(unittest.TestCase):
                 "user_decisions": [],
             }
             commands: list[list[str]] = []
+            cwds: list[object] = []
 
             def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
                 if "--version" in command:
                     return SimpleNamespace(returncode=0, stdout="codex-cli test", stderr="")
                 commands.append(command)
+                cwds.append(kwargs.get("cwd"))
                 output = Path(command[command.index("--output-last-message") + 1])
                 output.write_text(json.dumps(payload), encoding="utf-8")
                 return SimpleNamespace(
@@ -714,6 +716,9 @@ class ProviderCommandTests(unittest.TestCase):
         self.assertNotIn("-C", commands[1])
         self.assertNotIn("--sandbox", commands[1])
         self.assertTrue(resumed.session_resumed)
+        # `codex exec resume` has no `-C`, so the bundle must be the process cwd.
+        # Otherwise the resumed session reads whatever directory Ensemble runs from.
+        self.assertEqual(cwds, [root, root])
 
     def test_provider_call_records_reasoning_effort_in_manifest(self) -> None:
         from ensemble_core.state_machine import record_provider_call

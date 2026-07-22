@@ -204,6 +204,7 @@ def run_codex(
             try:
                 completed = subprocess.run(
                     command,
+                    cwd=bundle_dir,
                     input=prompt,
                     text=True,
                     capture_output=True,
