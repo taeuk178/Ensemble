@@ -166,6 +166,10 @@ def final(run_dir: Path) -> Path:
     return run_dir / "final.md"
 
 
+def readme(run_dir: Path) -> Path:
+    return run_dir / "README.md"
+
+
 def timeline(run_dir: Path) -> Path:
     return run_dir / "timeline.md"
 

@@ -20,7 +20,7 @@ from ensemble_core.errors import InputError, SchemaError, SecurityError, Semanti
 from ensemble_core.hashing import canonical_issue_key, parse_sections, refs_changed, section_hashes
 from ensemble_core.history import write_timeline
 from ensemble_core import layout
-from ensemble_core.io_utils import atomic_write_json, parse_answer_section, read_json
+from ensemble_core.io_utils import atomic_write_json, parse_answer_section, read_json, resolve_run
 from ensemble_core.isolated import save_final_assessment
 from ensemble_core.providers import ProviderResult
 from ensemble_core.registry import accept_risk, load_registry, record_author_decision
@@ -923,6 +923,149 @@ class ReviewSessionTests(RunCase):
         manifest = read_json(layout.manifest(self.run))
         self.assertEqual(manifest["codex_review_session"]["last_review_round"], 2)
         self.assertEqual(manifest["codex_review_session"]["request_hash"], verified_request_hash(self.run))
+
+
+class LayoutTests(RunCase):
+    """실행 디렉토리 구조를 고정한다.
+
+    경로를 옮길 때 코드가 조용히 다른 곳에 쓰는 것을 막는다. 여기서
+    확인하는 것은 `layout`이 돌려주는 경로가 아니라 실제로 생긴 파일의
+    위치다. 그래야 `layout`만 고치고 실제 쓰기를 빠뜨린 경우를 잡는다.
+    """
+
+    def relative(self, path: Path) -> str:
+        return path.relative_to(self.run).as_posix()
+
+    def test_init_places_input_and_state(self) -> None:
+        self.assertEqual(self.relative(layout.request(self.run)), "01-input/request.md")
+        self.assertEqual(self.relative(layout.request_original(self.run)), "01-input/request.original.txt")
+        self.assertEqual(self.relative(layout.rubric(self.run)), "01-input/rubric.md")
+        self.assertEqual(self.relative(layout.manifest(self.run)), "_state/manifest.json")
+        self.assertEqual(self.relative(layout.registry(self.run)), "_state/issue-registry.json")
+        self.assertEqual(self.relative(layout.reviewer_index(self.run)), "_state/reviewer-issue-index.json")
+        self.assertEqual(self.relative(layout.convergence(self.run)), "_state/convergence.json")
+        self.assertEqual(self.relative(layout.feedback_cards(self.run)), "_state/feedback-cards.md")
+        for path in (
+            layout.request(self.run),
+            layout.rubric(self.run),
+            layout.manifest(self.run),
+            layout.feedback_cards(self.run),
+        ):
+            self.assertTrue(path.exists(), path)
+
+    def test_human_facing_files_stay_at_the_root(self) -> None:
+        ingest_review(self.run, review=review(), review_round=1)
+        save_final_assessment(self.run, draft_path=layout.draft(self.run, 0), raw_review=review())
+        finalize(self.run, status="auto")
+        write_timeline(self.run)
+        self.assertEqual(self.relative(layout.final(self.run)), "final.md")
+        self.assertEqual(self.relative(layout.timeline(self.run)), "timeline.md")
+        self.assertEqual(self.relative(layout.decisions(self.run)), "decisions.md")
+        for path in (layout.final(self.run), layout.timeline(self.run), layout.decisions(self.run)):
+            self.assertTrue(path.exists(), path)
+
+    def test_draft_and_hashes_use_padded_numbers(self) -> None:
+        self.assertEqual(self.relative(layout.draft(self.run, 0)), "03-drafts/draft-00.md")
+        self.assertEqual(self.relative(layout.hashes(self.run, 0)), "_state/hashes/draft-00.json")
+        self.assertTrue(layout.draft(self.run, 0).exists())
+        self.assertTrue(layout.hashes(self.run, 0).exists())
+
+    def test_review_kinds_go_to_separate_folders(self) -> None:
+        ingest_review(self.run, review=review(blockers=[issue()]), review_round=1)
+        self.assertEqual(self.relative(layout.review(self.run, 1)), "04-reviews/iterative/r01.json")
+        self.assertTrue(layout.review(self.run, 1).exists())
+
+        save_final_assessment(self.run, draft_path=layout.draft(self.run, 0), raw_review=review())
+        self.assertEqual(self.relative(layout.blind(self.run, 0)), "04-reviews/blind/draft-00.json")
+        self.assertEqual(
+            self.relative(layout.reconciliation(self.run, 0)),
+            "04-reviews/reconciliation/draft-00.json",
+        )
+        self.assertTrue(layout.blind(self.run, 0).exists())
+        self.assertTrue(layout.reconciliation(self.run, 0).exists())
+        self.assertTrue(layout.final_reconciliation(self.run).exists())
+        self.assertEqual(
+            self.relative(layout.final_reconciliation(self.run)),
+            "_state/final-reconciliation.json",
+        )
+
+        self.assertEqual(self.relative(layout.promoted(self.run, 2)), "04-reviews/promoted/r02.json")
+        self.assertEqual(self.relative(layout.issue_audit(self.run, 2)), "04-reviews/audit/r02.json")
+        self.assertEqual(self.relative(layout.panel_issue(self.run, "R1-I1")), "04-reviews/panel/R1-I1")
+
+    def test_issue_audit_is_not_picked_up_as_an_iterative_review(self) -> None:
+        ingest_review(self.run, review=review(), review_round=1)
+        atomic_write_json(layout.issue_audit(self.run, 1), {"merged": []})
+        self.assertEqual(layout.iter_reviews(self.run), [layout.review(self.run, 1)])
+
+    def test_internal_artifacts_are_separated_from_state(self) -> None:
+        self.assertEqual(self.relative(layout.bundles_dir(self.run)), "_internal/bundles")
+        self.assertEqual(self.relative(layout.review_sessions_dir(self.run)), "_internal/review-sessions")
+        self.assertEqual(self.relative(layout.noise_dir(self.run)), "_internal/noise")
+
+    def test_rounds_sort_by_number_not_by_name(self) -> None:
+        for number in (1, 2, 10):
+            source = self.root / f"draft-{number}.md"
+            source.write_text(f"# 스펙 {number}\n\n## 오류 흐름\n\n내용\n", encoding="utf-8")
+            register_draft(self.run, source, number)
+        self.assertEqual([layout.round_of(path) for path in layout.iter_drafts(self.run)], [0, 1, 2, 10])
+
+    def test_new_runs_record_the_layout_version(self) -> None:
+        self.assertEqual(read_json(layout.manifest(self.run))["layout_version"], layout.LAYOUT_VERSION)
+
+    def test_readme_is_written_next_to_the_timeline(self) -> None:
+        ingest_review(self.run, review=review(blockers=[issue()]), review_round=1)
+        write_timeline(self.run)
+        readme = layout.readme(self.run)
+        self.assertEqual(self.relative(readme), "README.md")
+        text = readme.read_text(encoding="utf-8")
+        self.assertIn(self.run.name, text)
+        self.assertIn("미해결 이슈 1건", text)
+        self.assertIn("| 1 | 초안 0 | `NEEDS_REVISION` |", text)
+
+    def test_readme_reports_rounds_that_left_no_iterative_file(self) -> None:
+        """승격이 쓴 회차는 `iterative/`에 파일이 없어도 경과에 남아야 한다."""
+        ingest_review(self.run, review=review(), review_round=1)
+        manifest = read_json(layout.manifest(self.run))
+        manifest["review_history"].append(
+            {"review_round": 2, "draft_round": 0, "verdict": "NEEDS_REVISION"}
+        )
+        atomic_write_json(layout.manifest(self.run), manifest)
+        write_timeline(self.run)
+        self.assertFalse(layout.review(self.run, 2).exists())
+        self.assertIn("| 2 | 초안 0 | `NEEDS_REVISION` |", layout.readme(self.run).read_text(encoding="utf-8"))
+
+
+class LegacyRunTests(unittest.TestCase):
+    def test_v1_run_is_rejected_with_guidance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runs = Path(temporary) / "runs"
+            legacy = runs / "20260101T000000Z-spec-abc12345"
+            legacy.mkdir(parents=True)
+            (legacy / "manifest.json").write_text(
+                json.dumps({"state": "USER_DECISION_REQUIRED"}), encoding="utf-8"
+            )
+            (legacy / "final.md").write_text("# 최종\n", encoding="utf-8")
+            with patch("ensemble_core.io_utils.RUNS_ROOT", runs):
+                with self.assertRaises(StateError) as caught:
+                    resolve_run(legacy)
+        details = caught.exception.details
+        self.assertEqual(details["layout_version"], 1)
+        self.assertEqual(details["last_state"], "USER_DECISION_REQUIRED")
+        self.assertTrue(details["final"].endswith("final.md"))
+        self.assertIsNone(details["timeline"])
+
+    def test_v1_state_files_are_not_used_to_serve_commands(self) -> None:
+        """안내만 하고 v1 상태를 읽어 명령을 처리하지는 않는다."""
+        with tempfile.TemporaryDirectory() as temporary:
+            runs = Path(temporary) / "runs"
+            legacy = runs / "20260101T000000Z-spec-abc12345"
+            legacy.mkdir(parents=True)
+            (legacy / "manifest.json").write_text(json.dumps({"state": "APPROVED"}), encoding="utf-8")
+            (legacy / "issue-registry.json").write_text("{}", encoding="utf-8")
+            with patch("ensemble_core.io_utils.RUNS_ROOT", runs):
+                with self.assertRaises(StateError):
+                    resolve_run(legacy)
 
 
 if __name__ == "__main__":

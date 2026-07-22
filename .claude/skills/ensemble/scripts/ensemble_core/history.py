@@ -164,4 +164,85 @@ def write_timeline(run_dir: Path) -> Path:
         lines.append(f"- 종료 사유: {manifest['termination_reason']}")
     destination = layout.timeline(run_dir)
     atomic_write_text(destination, "\n".join(lines).rstrip() + "\n")
+    write_readme(run_dir)
+    return destination
+
+
+def write_readme(run_dir: Path) -> Path:
+    """폴더를 열었을 때 먼저 읽을 진입점.
+
+    나머지 파일을 열지 않고도 상태와 남은 이슈를 알 수 있게 한다.
+    검토 회차는 `04-reviews/`의 파일 목록이 아니라 manifest의 기록을
+    쓴다. 승격이 쓴 회차는 `iterative/`에 파일이 없기 때문이다.
+    """
+    manifest = read_json(layout.manifest(run_dir))
+    registry = read_json(layout.registry(run_dir), default={})
+    open_ids = sorted(
+        issue_id
+        for issue_id, issue in registry.items()
+        if issue.get("status") in {"OPEN", "USER_PENDING", "PANEL_PENDING"}
+    )
+    limits = manifest.get("limits", {})
+    lines = [
+        f"# 실행 {manifest.get('run_id')}",
+        "",
+        "| | |",
+        "|---|---|",
+        f"| 상태 | `{manifest.get('state')}` |",
+        f"| 종료 사유 | {manifest.get('termination_reason') or '진행 중'} |",
+        f"| 미해결 이슈 | {len(open_ids)}건 |",
+        f"| 검토 회차 | {manifest.get('last_review_round', 0)} / {limits.get('review_rounds', '?')} |",
+        f"| 최종 초안 | 초안 {manifest.get('current_round', 0)} |",
+        f"| 시작 · 종료 | {manifest.get('started_at')} · {manifest.get('finished_at') or '진행 중'} |",
+        "",
+        "## 어디부터 볼까",
+        "",
+    ]
+    if layout.final(run_dir).exists():
+        lines.append("1. [final.md](final.md) — 결과물. 미해결 이슈는 문서 끝 부록에 있다.")
+    else:
+        lines.append("1. final.md — 아직 없다. 실행이 끝나면 생긴다.")
+    lines.extend(
+        [
+            "2. [timeline.md](timeline.md) — 회차별 경과와 판정.",
+            "3. [decisions.md](decisions.md) — 각 이슈를 왜 그렇게 처리했는지.",
+            "",
+            "## 폴더",
+            "",
+            "| 경로 | 내용 |",
+            "|---|---|",
+            "| `01-input/` | 사용자 원문, 구조화된 요청, 완료 기준 |",
+            "| `02-proposals/` | Claude와 GPT의 독립 제안 |",
+            "| `03-drafts/` | 회차별 초안 |",
+            "| `04-reviews/iterative/` | 반복 검토. `rNN`은 검토 회차 |",
+            "| `04-reviews/blind/` | 최종 독립 검토. `draft-NN`은 대상 초안 |",
+            "| `04-reviews/promoted/` | 독립 검토 이슈를 일반 이슈로 올린 기록 |",
+            "| `04-reviews/reconciliation/` | 수용된 위험과의 대조 |",
+            "| `04-reviews/audit/` | 이슈 중복 점검 |",
+            "| `04-reviews/panel/` | 추가 평가자 판정 |",
+            "| `_state/` | 실행 상태와 이슈 대장. 코드가 읽는다 |",
+            "| `_internal/` | 입력 묶음 기록과 검토 세션 작업 폴더 |",
+            "",
+            "회차 번호는 두 종류다. `rNN`은 검토 회차, `draft-NN`은 대상 초안이다.",
+            "`iterative/`에 빠진 번호는 그 회차를 승격이 썼다는 뜻이다.",
+            "",
+        ]
+    )
+    history = manifest.get("review_history", [])
+    if history:
+        lines.extend(["## 검토 경과", "", "| 검토 | 대상 | 판정 |", "|---|---|---|"])
+        for entry in history:
+            lines.append(
+                f"| {entry.get('review_round')} | 초안 {entry.get('draft_round')} "
+                f"| `{entry.get('verdict', '미기록')}` |"
+            )
+        lines.append("")
+    if open_ids:
+        lines.extend([f"## 미해결 이슈 {len(open_ids)}건", "", "| ID | 중요도 | 문제 |", "|---|---|---|"])
+        for issue_id in open_ids:
+            latest = registry[issue_id].get("latest_issue") or {}
+            lines.append(f"| `{issue_id}` | {latest.get('severity', '?')} | {latest.get('problem', '')} |")
+        lines.append("")
+    destination = layout.readme(run_dir)
+    atomic_write_text(destination, "\n".join(lines).rstrip() + "\n")
     return destination
