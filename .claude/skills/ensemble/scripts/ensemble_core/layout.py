@@ -12,10 +12,22 @@ from pathlib import Path
 
 
 # 새 실행에 기록하는 레이아웃 버전. 구조를 바꿀 때 올린다.
-LAYOUT_VERSION = 1
+LAYOUT_VERSION = 2
 
 # init이 미리 만들어 두는 하위 디렉토리.
-RUN_SUBDIRS = ("proposals", "drafts", "reviews", "panel", "hashes", "bundles")
+RUN_SUBDIRS = (
+    "01-input",
+    "02-proposals",
+    "03-drafts",
+    "04-reviews/iterative",
+    "04-reviews/blind",
+    "04-reviews/promoted",
+    "04-reviews/audit",
+    "04-reviews/reconciliation",
+    "04-reviews/panel",
+    "_state/hashes",
+    "_internal/bundles",
+)
 
 
 def round_of(path: Path) -> int:
@@ -39,113 +51,113 @@ def _by_round(paths: list[Path]) -> list[Path]:
 # --- 입력 -------------------------------------------------------------
 
 def request(run_dir: Path) -> Path:
-    return run_dir / "request.md"
+    return run_dir / "01-input" / "request.md"
 
 
 def request_original(run_dir: Path) -> Path:
-    return run_dir / "request.original.txt"
+    return run_dir / "01-input" / "request.original.txt"
 
 
 def rubric(run_dir: Path) -> Path:
-    return run_dir / "rubric.md"
+    return run_dir / "01-input" / "rubric.md"
 
 
 # --- 제안 -------------------------------------------------------------
 
 def proposal(run_dir: Path, name: str) -> Path:
-    return run_dir / "proposals" / name
+    return run_dir / "02-proposals" / name
 
 
 # --- 초안 -------------------------------------------------------------
 
 def draft(run_dir: Path, round_number: int) -> Path:
-    return run_dir / "drafts" / f"round-{round_number}.md"
+    return run_dir / "03-drafts" / f"draft-{round_number:02d}.md"
 
 
 def iter_drafts(run_dir: Path) -> list[Path]:
-    return _by_round(list((run_dir / "drafts").glob("round-*.md")))
+    return _by_round(list((run_dir / "03-drafts").glob("draft-*.md")))
 
 
 # --- 검토 -------------------------------------------------------------
 
 def review(run_dir: Path, review_round: int) -> Path:
-    return run_dir / "reviews" / f"round-{review_round}.json"
+    return run_dir / "04-reviews" / "iterative" / f"r{review_round:02d}.json"
 
 
 def iter_reviews(run_dir: Path) -> list[Path]:
-    return _by_round(list((run_dir / "reviews").glob("round-*.json")))
+    return _by_round(list((run_dir / "04-reviews" / "iterative").glob("r*.json")))
 
 
 def blind(run_dir: Path, draft_round: int, suffix: str = "") -> Path:
-    return run_dir / "reviews" / f"final-blind-round-{draft_round}{suffix}.json"
+    return run_dir / "04-reviews" / "blind" / f"draft-{draft_round:02d}{suffix}.json"
 
 
 def iter_blind_attempts(run_dir: Path, draft_round: int) -> list[Path]:
     """같은 초안을 두 번 이상 독립 검토했을 때 쌓인 파일들."""
-    return sorted((run_dir / "reviews").glob(f"final-blind-round-{draft_round}*.json"))
+    return sorted((run_dir / "04-reviews" / "blind").glob(f"draft-{draft_round:02d}*.json"))
 
 
 def iter_blinds(run_dir: Path) -> list[Path]:
-    return sorted((run_dir / "reviews").glob("final-blind-round-*.json"))
+    return sorted((run_dir / "04-reviews" / "blind").glob("draft-*.json"))
 
 
 def promoted(run_dir: Path, review_round: int) -> Path:
-    return run_dir / "reviews" / f"final-promoted-round-{review_round}.json"
+    return run_dir / "04-reviews" / "promoted" / f"r{review_round:02d}.json"
 
 
 def iter_promoted(run_dir: Path) -> list[Path]:
-    return _by_round(list((run_dir / "reviews").glob("final-promoted-round-*.json")))
+    return _by_round(list((run_dir / "04-reviews" / "promoted").glob("r*.json")))
 
 
 def reconciliation(run_dir: Path, draft_round: int, suffix: str = "") -> Path:
-    return run_dir / "reviews" / f"final-reconciliation-round-{draft_round}{suffix}.json"
+    return run_dir / "04-reviews" / "reconciliation" / f"draft-{draft_round:02d}{suffix}.json"
 
 
 def issue_audit(run_dir: Path, review_round: int) -> Path:
-    return run_dir / "reviews" / f"issue-audit-round-{review_round}.json"
+    return run_dir / "04-reviews" / "audit" / f"r{review_round:02d}.json"
 
 
 def panel_issue(run_dir: Path, issue_id: str) -> Path:
-    return run_dir / "panel" / issue_id
+    return run_dir / "04-reviews" / "panel" / issue_id
 
 
 # --- 실행 상태 --------------------------------------------------------
 
 def manifest(run_dir: Path) -> Path:
-    return run_dir / "manifest.json"
+    return run_dir / "_state" / "manifest.json"
 
 
 def registry(run_dir: Path) -> Path:
-    return run_dir / "issue-registry.json"
+    return run_dir / "_state" / "issue-registry.json"
 
 
 def reviewer_index(run_dir: Path) -> Path:
-    return run_dir / "reviewer-issue-index.json"
+    return run_dir / "_state" / "reviewer-issue-index.json"
 
 
 def convergence(run_dir: Path) -> Path:
-    return run_dir / "convergence.json"
+    return run_dir / "_state" / "convergence.json"
 
 
 def feedback_cards(run_dir: Path) -> Path:
-    return run_dir / "feedback-cards.md"
+    return run_dir / "_state" / "feedback-cards.md"
 
 
 def final_reconciliation(run_dir: Path) -> Path:
     """최신 종료 판정용 사본. 회차별 원본은 `reconciliation()`에 있다."""
-    return run_dir / "final-reconciliation.json"
+    return run_dir / "_state" / "final-reconciliation.json"
 
 
 def hashes(run_dir: Path, round_number: int) -> Path:
-    return run_dir / "hashes" / f"round-{round_number}.json"
+    return hashes_dir(run_dir) / f"draft-{round_number:02d}.json"
 
 
 def hashes_dir(run_dir: Path) -> Path:
-    return run_dir / "hashes"
+    return run_dir / "_state" / "hashes"
 
 
 def iter_hashes(run_dir: Path) -> list[Path]:
-    return _by_round(list(hashes_dir(run_dir).glob("round-*.json")))
+    return _by_round(list(hashes_dir(run_dir).glob("draft-*.json")))
 
 
 # --- 사람이 읽는 결과 -------------------------------------------------
@@ -165,16 +177,16 @@ def decisions(run_dir: Path) -> Path:
 # --- 내부 산출물 ------------------------------------------------------
 
 def bundles_dir(run_dir: Path) -> Path:
-    return run_dir / "bundles"
+    return run_dir / "_internal" / "bundles"
 
 
 def review_sessions_dir(run_dir: Path) -> Path:
-    return run_dir / "review-sessions"
+    return run_dir / "_internal" / "review-sessions"
 
 
 def review_session(run_dir: Path, request_hash: str) -> Path:
-    return run_dir / "review-sessions" / request_hash
+    return review_sessions_dir(run_dir) / request_hash
 
 
 def noise_dir(run_dir: Path) -> Path:
-    return run_dir / "noise"
+    return run_dir / "_internal" / "noise"

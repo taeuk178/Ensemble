@@ -19,6 +19,7 @@ from ensemble_core.convergence import refresh_author_dispositions, reproducibili
 from ensemble_core.errors import InputError, SchemaError, SecurityError, SemanticValidationError, StateError
 from ensemble_core.hashing import canonical_issue_key, parse_sections, refs_changed, section_hashes
 from ensemble_core.history import write_timeline
+from ensemble_core import layout
 from ensemble_core.io_utils import atomic_write_json, parse_answer_section, read_json
 from ensemble_core.isolated import save_final_assessment
 from ensemble_core.providers import ProviderResult
@@ -140,8 +141,8 @@ class InputAndHashingTests(unittest.TestCase):
                 "ensemble_core.io_utils.RUNS_ROOT", runs
             ):
                 run = initialize_run(original, allow_reuse=True)
-            self.assertEqual((run / "request.original.txt").read_text(encoding="utf-8"), original)
-            self.assertIn(original, (run / "request.md").read_text(encoding="utf-8"))
+            self.assertEqual(layout.request_original(run).read_text(encoding="utf-8"), original)
+            self.assertIn(original, layout.request(run).read_text(encoding="utf-8"))
 
 
 class ValidationTests(unittest.TestCase):
@@ -214,7 +215,7 @@ class RegistryAndWorkflowTests(RunCase):
     def test_new_issue_gets_wrapper_id_and_projection_hides_scores(self) -> None:
         issue_id = self.first_issue()
         self.assertEqual(issue_id, "R1-I1")
-        projection = read_json(self.run / "reviewer-issue-index.json")
+        projection = read_json(layout.reviewer_index(self.run))
         rendered = json.dumps(projection)
         self.assertNotIn("severity", rendered)
         self.assertNotIn("confidence", rendered)
@@ -278,7 +279,7 @@ class RegistryAndWorkflowTests(RunCase):
             argument="원문에 요구가 없다.",
             action="수정하지 않음",
         )
-        card = build_feedback_cards(self.run, self.run / "drafts" / "round-0.md")
+        card = build_feedback_cards(self.run, layout.draft(self.run, 0))
         self.assertNotIn("severity", card)
         self.assertNotIn("confidence", card)
         self.assertIn("요청 범위 밖이다", card)
@@ -307,7 +308,7 @@ class RegistryAndWorkflowTests(RunCase):
             review_round=2,
         )
         self.assertEqual(result["verdict"], "NEEDS_REVISION")
-        manifest = read_json(self.run / "manifest.json")
+        manifest = read_json(layout.manifest(self.run))
         self.assertEqual(manifest["last_reviewed_draft_round"], 0)
         self.assertEqual(manifest["review_history"][-1]["draft_round"], 0)
 
@@ -354,7 +355,7 @@ class RegistryAndWorkflowTests(RunCase):
                     action="CONTINUE",
                     note="정체 신호 검증을 위해 사용자가 계속 진행을 승인함",
                 )
-        convergence = read_json(self.run / "convergence.json")
+        convergence = read_json(layout.convergence(self.run))
         self.assertFalse(convergence["rounds"][1]["issue_set_stalled"])
         self.assertTrue(convergence["rounds"][2]["issue_set_stalled"])
 
@@ -394,7 +395,7 @@ class RegistryAndWorkflowTests(RunCase):
             action="없음",
         )
         refresh_author_dispositions(self.run, 2)
-        manifest = read_json(self.run / "manifest.json")
+        manifest = read_json(layout.manifest(self.run))
         self.assertEqual(manifest["state"], "USER_DECISION_REQUIRED")
         self.assertEqual(manifest["escalation_signals"][0]["type"], "AUTHOR_DEADLOCK")
         with self.assertRaises(StateError):
@@ -452,7 +453,7 @@ class RegistryAndWorkflowTests(RunCase):
                 action="수정",
             )
             refresh_author_dispositions(self.run, review_round)
-        manifest = read_json(self.run / "manifest.json")
+        manifest = read_json(layout.manifest(self.run))
         self.assertEqual(manifest["state"], "USER_DECISION_REQUIRED")
         self.assertEqual(manifest["escalation_signals"][0]["type"], "REVIEWER_STORM")
         with self.assertRaises(StateError):
@@ -469,12 +470,12 @@ class RegistryAndWorkflowTests(RunCase):
         }
         from ensemble_core.io_utils import atomic_write_json
 
-        atomic_write_json(self.run / "issue-registry.json", registry)
-        manifest = read_json(self.run / "manifest.json")
+        atomic_write_json(layout.registry(self.run), registry)
+        manifest = read_json(layout.manifest(self.run))
         manifest["phase"] = "3"
         manifest["state"] = "ESCALATION_REQUIRED"
         manifest["escalation_signals"] = [{"type": "REVIEWER_STORM", "round": 1}]
-        atomic_write_json(self.run / "manifest.json", manifest)
+        atomic_write_json(layout.manifest(self.run), manifest)
         payload = {
             "issues": [
                 {
@@ -497,7 +498,7 @@ class RegistryAndWorkflowTests(RunCase):
         }
         apply_audit(self.run, round_number=1, payload=payload)
         self.assertEqual(load_registry(self.run)["R1-I2"]["status"], "MERGED")
-        manifest = read_json(self.run / "manifest.json")
+        manifest = read_json(layout.manifest(self.run))
         self.assertEqual(manifest["pending_panel_issue_ids"], [first])
         self.assertEqual(manifest["state"], "ESCALATION_REQUIRED")
 
@@ -509,7 +510,7 @@ class AcceptedRiskTests(RunCase):
         self.assertEqual(accepted["status"], "ACCEPTED_RISK")
         result = save_final_assessment(
             self.run,
-            draft_path=self.run / "drafts" / "round-0.md",
+            draft_path=layout.draft(self.run, 0),
             raw_review=review(blockers=[issue()]),
         )
         self.assertTrue(result["passed"])
@@ -528,7 +529,7 @@ class AcceptedRiskTests(RunCase):
         raw = review()
         result = save_final_assessment(
             self.run,
-            draft_path=self.run / "drafts" / "round-0.md",
+            draft_path=layout.draft(self.run, 0),
             raw_review=raw,
         )
         stored = read_json(Path(result["raw_review_path"]))
@@ -538,7 +539,7 @@ class AcceptedRiskTests(RunCase):
 
 class BundleAndReportTests(RunCase):
     def test_manifest_uses_agy_panel_provider(self) -> None:
-        models = read_json(self.run / "manifest.json")["models"]
+        models = read_json(layout.manifest(self.run))["models"]
         self.assertIn("agy", models)
         self.assertNotIn("gemini", models)
         self.assertEqual(models["agy"]["requested"], "gemini-3.6-flash-high")
@@ -548,7 +549,7 @@ class BundleAndReportTests(RunCase):
         with isolated_bundle(
             self.run,
             mode="final",
-            draft_path=self.run / "drafts" / "round-0.md",
+            draft_path=layout.draft(self.run, 0),
         ) as bundle:
             self.assertEqual({path.name for path in bundle.iterdir()}, {"request.md", "rubric.md", "draft.md"})
 
@@ -556,12 +557,12 @@ class BundleAndReportTests(RunCase):
         ingest_review(self.run, review=review(), review_round=1)
         save_final_assessment(
             self.run,
-            draft_path=self.run / "drafts" / "round-0.md",
+            draft_path=layout.draft(self.run, 0),
             raw_review=review(),
         )
         result = finalize(self.run, status="auto")
         self.assertEqual(result["status"], "CONVERGED")
-        self.assertTrue((self.run / "final.md").exists())
+        self.assertTrue(layout.final(self.run).exists())
 
     def test_run_ids_are_unique(self) -> None:
         second = initialize_run("오류 처리 문서", allow_reuse=True)
@@ -570,7 +571,7 @@ class BundleAndReportTests(RunCase):
     def test_request_becomes_immutable_after_draft(self) -> None:
         from ensemble_core.workflow import save_artifact
         structured = self.root / "request.md"
-        structured.write_text((self.run / "request.md").read_text(encoding="utf-8"), encoding="utf-8")
+        structured.write_text(layout.request(self.run).read_text(encoding="utf-8"), encoding="utf-8")
         from ensemble_core.errors import StateError
 
         with self.assertRaises(StateError):
@@ -583,7 +584,7 @@ class BundleAndReportTests(RunCase):
         ):
             with self.assertRaises(StateError):
                 assert_source_unchanged(self.run)
-        self.assertEqual(read_json(self.run / "manifest.json")["state"], "RUN_TAINTED")
+        self.assertEqual(read_json(layout.manifest(self.run))["state"], "RUN_TAINTED")
 
     def test_timeline_summarizes_review_and_draft_mapping(self) -> None:
         ingest_review(self.run, review=review(), review_round=1)
@@ -803,7 +804,8 @@ class ProviderCommandTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             run_dir = Path(temporary)
-            (run_dir / "manifest.json").write_text(
+            layout.manifest(run_dir).parent.mkdir(parents=True, exist_ok=True)
+            layout.manifest(run_dir).write_text(
                 json.dumps({"models": {"codex": {"requested": "test-model"}}}),
                 encoding="utf-8",
             )
@@ -816,7 +818,7 @@ class ProviderCommandTests(unittest.TestCase):
                 reasoning_effort="high",
             )
             record_provider_call(run_dir, provider="codex", operation="review", result=result)
-            manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+            manifest = json.loads(layout.manifest(run_dir).read_text(encoding="utf-8"))
 
         self.assertEqual(manifest["models"]["codex"]["reasoning_effort"], "high")
         self.assertEqual(manifest["provider_calls"][0]["reasoning_effort"], "high")
@@ -845,7 +847,7 @@ class ProviderCommandTests(unittest.TestCase):
 class ReviewSessionTests(RunCase):
     def test_review_session_bundle_rejects_allowed_name_symlink(self) -> None:
         request_hash = verified_request_hash(self.run)
-        workspace = self.run / "review-sessions" / request_hash
+        workspace = layout.review_session(self.run, request_hash)
         workspace.mkdir(parents=True)
         outside = self.root / "outside.md"
         outside.write_text("보호할 내용", encoding="utf-8")
@@ -854,7 +856,7 @@ class ReviewSessionTests(RunCase):
         with self.assertRaises(SecurityError):
             prepare_review_session_bundle(
                 self.run,
-                draft_path=self.run / "drafts" / "round-0.md",
+                draft_path=layout.draft(self.run, 0),
                 request_hash=request_hash,
             )
         self.assertEqual(outside.read_text(encoding="utf-8"), "보호할 내용")
@@ -863,7 +865,7 @@ class ReviewSessionTests(RunCase):
         request_hash = verified_request_hash(self.run)
         workspace = prepare_review_session_bundle(
             self.run,
-            draft_path=self.run / "drafts" / "round-0.md",
+            draft_path=layout.draft(self.run, 0),
             request_hash=request_hash,
         )
         record_codex_review_session(
@@ -874,9 +876,9 @@ class ReviewSessionTests(RunCase):
         )
         self.assertEqual(load_codex_review_session(self.run)["session_id"], "session-123")
 
-        manifest = read_json(self.run / "manifest.json")
+        manifest = read_json(layout.manifest(self.run))
         manifest["codex_review_session"]["request_hash"] = "0" * 64
-        atomic_write_json(self.run / "manifest.json", manifest)
+        atomic_write_json(layout.manifest(self.run), manifest)
         with self.assertRaises(StateError):
             load_codex_review_session(self.run)
 
@@ -918,7 +920,7 @@ class ReviewSessionTests(RunCase):
         self.assertEqual(received_session_ids, [None, "session-123"])
         self.assertFalse(first.session_resumed)
         self.assertTrue(second.session_resumed)
-        manifest = read_json(self.run / "manifest.json")
+        manifest = read_json(layout.manifest(self.run))
         self.assertEqual(manifest["codex_review_session"]["last_review_round"], 2)
         self.assertEqual(manifest["codex_review_session"]["request_hash"], verified_request_hash(self.run))
 

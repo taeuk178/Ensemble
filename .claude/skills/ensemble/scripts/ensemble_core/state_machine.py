@@ -128,6 +128,7 @@ def initialize_run(
     atomic_write_text(layout.decisions(run_dir), "# Decisions\n", overwrite=False)
     manifest = {
         "schema_version": 1,
+        "layout_version": layout.LAYOUT_VERSION,
         "run_id": run_id,
         "phase": phase,
         "state": "INITIALIZED",

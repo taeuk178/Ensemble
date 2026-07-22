@@ -93,9 +93,40 @@ def resolve_run(run: str | Path) -> Path:
         direct = RUNS_ROOT / candidate
         candidate = direct if direct.exists() else Path.cwd() / candidate
     resolved = ensure_within(candidate, RUNS_ROOT)
-    if not resolved.is_dir() or not (resolved / "manifest.json").exists():
+    if not resolved.is_dir():
+        raise StateError(f"Not an ensemble run directory: {resolved}")
+    if not (resolved / "_state" / "manifest.json").exists():
+        _reject_legacy_run(resolved)
         raise StateError(f"Not an ensemble run directory: {resolved}")
     return resolved
+
+
+def _reject_legacy_run(run_dir: Path) -> None:
+    """구 레이아웃(v1) 실행이면 무엇을 열면 되는지 알려주고 멈춘다.
+
+    v1 상태 파일을 읽어 명령을 처리하지는 않는다. 그렇게 하면 경로마다
+    두 벌의 읽기 코드가 생긴다. 마지막 상태만 꺼내 안내에 넣는다.
+    """
+    legacy_manifest = run_dir / "manifest.json"
+    if not legacy_manifest.exists():
+        return
+    last_state = "확인 불가"
+    try:
+        last_state = str(json.loads(legacy_manifest.read_text(encoding="utf-8")).get("state") or last_state)
+    except (OSError, ValueError):
+        pass
+    final = run_dir / "final.md"
+    timeline = run_dir / "timeline.md"
+    raise StateError(
+        "이 실행은 구 레이아웃(v1)이라 명령을 지원하지 않습니다. "
+        f"마지막 기록 상태: {last_state}. final.md와 timeline.md는 직접 열어 주세요.",
+        details={
+            "layout_version": 1,
+            "last_state": last_state,
+            "final": str(final) if final.exists() else None,
+            "timeline": str(timeline) if timeline.exists() else None,
+        },
+    )
 
 
 def parse_answer_section(text: str) -> str:
