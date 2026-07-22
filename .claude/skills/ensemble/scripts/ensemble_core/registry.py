@@ -14,10 +14,11 @@ from .hashing import (
     refs_changed,
 )
 from .io_utils import atomic_write_json, atomic_write_text, read_json, utc_now
+from . import layout
 
 
 def load_registry(run_dir: Path) -> dict[str, Any]:
-    return read_json(run_dir / "issue-registry.json", default={})
+    return read_json(layout.registry(run_dir), default={})
 
 
 def _new_id(registry: dict[str, Any], round_number: int) -> str:
@@ -115,7 +116,7 @@ def apply_review(
         if basis == "MERGED" and resolution.get("merged_into"):
             entry["merged_into"] = resolution["merged_into"]
 
-    atomic_write_json(run_dir / "issue-registry.json", registry)
+    atomic_write_json(layout.registry(run_dir), registry)
     write_reviewer_projection(run_dir, registry)
     return {
         "assigned_ids": assigned,
@@ -146,7 +147,7 @@ def write_reviewer_projection(run_dir: Path, registry: dict[str, Any] | None = N
                 "author_requested_disposition": latest_author.get("requested_disposition"),
             }
         )
-    atomic_write_json(run_dir / "reviewer-issue-index.json", projection)
+    atomic_write_json(layout.reviewer_index(run_dir), projection)
     return projection
 
 
@@ -184,7 +185,7 @@ def record_author_decision(
         "recorded_at": utc_now(),
     }
     registry[issue_id].setdefault("author_disposition_history", []).append(event)
-    atomic_write_json(run_dir / "issue-registry.json", registry)
+    atomic_write_json(layout.registry(run_dir), registry)
     write_reviewer_projection(run_dir, registry)
     section = f"""
 
@@ -200,7 +201,7 @@ def record_author_decision(
 - 조치: {action}
 - 다음 검토 상태: PENDING
 """
-    decisions_path = run_dir / "decisions.md"
+    decisions_path = layout.decisions(run_dir)
     existing = decisions_path.read_text(encoding="utf-8")
     atomic_write_text(decisions_path, existing.rstrip() + section)
 
@@ -215,7 +216,7 @@ def accept_risk(run_dir: Path, *, issue_id: str, note: str, round_number: int) -
     latest = dict(issue.get("latest_issue") or {})
     if int(latest.get("severity", 0)) < 3:
         raise StateError("Only severity 3-5 issues need ACCEPTED_RISK")
-    draft_path = run_dir / "drafts" / f"round-{round_number}.md"
+    draft_path = layout.draft(run_dir, round_number)
     if not draft_path.exists():
         raise StateError(f"Draft round {round_number} does not exist")
     markdown = draft_path.read_text(encoding="utf-8")
@@ -252,6 +253,6 @@ def accept_risk(run_dir: Path, *, issue_id: str, note: str, round_number: int) -
     issue.setdefault("status_history", []).append(
         {"round": round_number, "from": previous_status, "to": "ACCEPTED_RISK"}
     )
-    atomic_write_json(run_dir / "issue-registry.json", registry)
+    atomic_write_json(layout.registry(run_dir), registry)
     write_reviewer_projection(run_dir, registry)
     return issue

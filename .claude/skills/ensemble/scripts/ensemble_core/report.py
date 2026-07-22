@@ -9,17 +9,18 @@ from .errors import InputError, StateError
 from .io_utils import atomic_write_text, read_json
 from .registry import load_registry
 from .state_machine import mark_terminal
+from . import layout
 
 
 def infer_terminal_status(run_dir: Path) -> tuple[str, str]:
-    manifest = read_json(run_dir / "manifest.json")
+    manifest = read_json(layout.manifest(run_dir))
     registry = load_registry(run_dir)
     open_gating = [
         issue_id
         for issue_id, issue in registry.items()
         if issue.get("status") in OPEN_STATUSES and issue.get("gating", True)
     ]
-    reconciliation = read_json(run_dir / "final-reconciliation.json", default={})
+    reconciliation = read_json(layout.final_reconciliation(run_dir), default={})
     if not reconciliation:
         raise StateError("최종 독립 검토를 마친 뒤에만 자동으로 종료할 수 있습니다.")
     latest_review_is_current_approval = (
@@ -82,7 +83,7 @@ def _accepted_risk_appendix(registry: dict[str, Any]) -> str:
 
 
 def finalize(run_dir: Path, *, status: str) -> dict[str, Any]:
-    manifest = read_json(run_dir / "manifest.json")
+    manifest = read_json(layout.manifest(run_dir))
     if status == "auto":
         status, reason = infer_terminal_status(run_dir)
     else:
@@ -92,9 +93,9 @@ def finalize(run_dir: Path, *, status: str) -> dict[str, Any]:
             if inferred != "CONVERGED":
                 raise StateError(f"CONVERGED 조건을 충족하지 못했습니다: {inferred_reason}")
     current_round = int(manifest.get("current_round", 0))
-    draft_path = run_dir / "drafts" / f"round-{current_round}.md"
+    draft_path = layout.draft(run_dir, current_round)
     if not draft_path.exists():
-        candidates = sorted((run_dir / "drafts").glob("round-*.md"))
+        candidates = layout.iter_drafts(run_dir)
         if not candidates:
             raise StateError("최종 문서로 만들 초안이 없습니다.")
         draft_path = candidates[-1]
@@ -105,9 +106,9 @@ def finalize(run_dir: Path, *, status: str) -> dict[str, Any]:
     final_text = header + body
     if appendices:
         final_text += "\n\n---\n\n" + "\n\n".join(appendices)
-    atomic_write_text(run_dir / "final.md", final_text)
+    atomic_write_text(layout.final(run_dir), final_text)
     marked = mark_terminal(run_dir, status, reason)
-    convergence = read_json(run_dir / "convergence.json", default={"rounds": []})
+    convergence = read_json(layout.convergence(run_dir), default={"rounds": []})
     resolution_counts: Counter[str] = Counter()
     resolved_without = 0
     for record in convergence.get("rounds", []):
@@ -116,7 +117,7 @@ def finalize(run_dir: Path, *, status: str) -> dict[str, Any]:
     return {
         "status": status,
         "reason": reason,
-        "final": str(run_dir / "final.md"),
+        "final": str(layout.final(run_dir)),
         "rounds": len(convergence.get("rounds", [])),
         "issue_set_stalled_rounds": [
             record["round"] for record in convergence.get("rounds", []) if record.get("issue_set_stalled")

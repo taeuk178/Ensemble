@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .io_utils import normalize_text, sha256_text, slugify
+from . import layout
 
 
 @dataclass(frozen=True)
@@ -169,7 +170,7 @@ def canonical_issue_key(markdown: str, issue: dict[str, object], *, unmatched_sa
 
 
 def load_hashes_for_round(run_dir: Path, round_number: int) -> dict[str, str]:
-    path = run_dir / "hashes" / f"round-{round_number}.json"
+    path = layout.hashes(run_dir, round_number)
     if not path.exists():
         return {}
     import json

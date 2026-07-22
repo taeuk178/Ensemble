@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from .io_utils import atomic_write_text, read_json
+from . import layout
 
 
 def _relative(run_dir: Path, path: Path) -> str:
@@ -23,8 +24,8 @@ def _status_at(issue: dict[str, Any], round_number: int) -> str:
 
 
 def write_timeline(run_dir: Path) -> Path:
-    manifest = read_json(run_dir / "manifest.json")
-    registry = read_json(run_dir / "issue-registry.json", default={})
+    manifest = read_json(layout.manifest(run_dir))
+    registry = read_json(layout.registry(run_dir), default={})
     lines = [
         "# Ensemble 작업 기록",
         "",
@@ -55,21 +56,18 @@ def write_timeline(run_dir: Path) -> Path:
         )
 
     lines.extend(["", "## 독립 제안", ""])
-    claude = run_dir / "proposals" / "claude.md"
-    gpt = run_dir / "proposals" / "gpt.json"
+    claude = layout.proposal(run_dir, "claude.md")
+    gpt = layout.proposal(run_dir, "gpt.json")
     lines.append(f"- Claude: [{_relative(run_dir, claude)}]({_relative(run_dir, claude)})" if claude.exists() else "- Claude: 아직 없음")
     lines.append(f"- GPT: [{_relative(run_dir, gpt)}]({_relative(run_dir, gpt)})" if gpt.exists() else "- GPT: 아직 없음")
 
     review_history = manifest.get("review_history", [])
     if not review_history:
         review_history = []
-        for review_path in sorted(
-            (run_dir / "reviews").glob("round-*.json"),
-            key=lambda path: int(path.stem.split("-", 1)[1]),
-        ):
-            review_round = int(review_path.stem.split("-", 1)[1])
+        for review_path in layout.iter_reviews(run_dir):
+            review_round = layout.round_of(review_path)
             inferred_draft = review_round - 1
-            if (run_dir / "drafts" / f"round-{inferred_draft}.md").exists():
+            if (layout.draft(run_dir, inferred_draft)).exists():
                 review_history.append(
                     {"review_round": review_round, "draft_round": inferred_draft}
                 )
@@ -79,7 +77,7 @@ def write_timeline(run_dir: Path) -> Path:
     for entry in review_history:
         review_round = int(entry["review_round"])
         draft_round = int(entry["draft_round"])
-        review_path = run_dir / "reviews" / f"round-{review_round}.json"
+        review_path = layout.review(run_dir, review_round)
         review: dict[str, Any] = read_json(review_path, default={})
         lines.extend(
             [
@@ -91,7 +89,7 @@ def write_timeline(run_dir: Path) -> Path:
                 f"- 요약: {review.get('summary', '미기록')}",
             ]
         )
-        promoted_path = run_dir / "reviews" / f"final-promoted-round-{review_round}.json"
+        promoted_path = layout.promoted(run_dir, review_round)
         issue_ids = sorted(
             issue_id
             for issue_id, issue in registry.items()
@@ -124,10 +122,7 @@ def write_timeline(run_dir: Path) -> Path:
                 )
         lines.append("")
 
-    promoted_paths = sorted(
-        (run_dir / "reviews").glob("final-promoted-round-*.json"),
-        key=lambda path: int(path.stem.rsplit("-", 1)[1]),
-    )
+    promoted_paths = layout.iter_promoted(run_dir)
     if promoted_paths:
         lines.extend(["## 최종 독립 검토에서 새로 발견한 이슈 (`FINAL_BLIND`)", ""])
         for path in promoted_paths:
@@ -140,7 +135,7 @@ def write_timeline(run_dir: Path) -> Path:
                 lines.append(f"- {finding.get('problem', '')}")
             lines.append("")
 
-    final_blind_paths = sorted((run_dir / "reviews").glob("final-blind-round-*.json"))
+    final_blind_paths = layout.iter_blinds(run_dir)
     if final_blind_paths:
         lines.extend(["## 최종 독립 검토 (`FINAL_BLIND`)", ""])
         for path in final_blind_paths:
@@ -163,10 +158,10 @@ def write_timeline(run_dir: Path) -> Path:
         lines.append("")
 
     lines.extend(["## 최종 결과", ""])
-    final_path = run_dir / "final.md"
+    final_path = layout.final(run_dir)
     lines.append("- [final.md](final.md)" if final_path.exists() else "- 아직 최종 문서가 없습니다.")
     if manifest.get("termination_reason"):
         lines.append(f"- 종료 사유: {manifest['termination_reason']}")
-    destination = run_dir / "timeline.md"
+    destination = layout.timeline(run_dir)
     atomic_write_text(destination, "\n".join(lines).rstrip() + "\n")
     return destination

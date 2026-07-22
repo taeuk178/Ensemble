@@ -23,17 +23,15 @@ from .state_machine import (
     verified_request_hash,
 )
 from .validation import validate_against_schema, validate_review_semantics
+from . import layout
 
 
 def current_draft(run_dir: Path) -> tuple[int, Path]:
-    drafts = sorted(
-        run_dir.joinpath("drafts").glob("round-*.md"),
-        key=lambda path: int(path.stem.split("-", 1)[1]),
-    )
+    drafts = layout.iter_drafts(run_dir)
     if not drafts:
         raise StateError("No draft has been registered")
     path = drafts[-1]
-    return int(path.stem.split("-", 1)[1]), path
+    return layout.round_of(path), path
 
 
 def save_artifact(
@@ -44,7 +42,7 @@ def save_artifact(
     round_number: int | None = None,
 ) -> dict[str, Any]:
     if kind == "claude-proposal":
-        destination = run_dir / "proposals" / "claude.md"
+        destination = layout.proposal(run_dir, "claude.md")
         if destination.exists():
             raise StateError("Claude proposal already exists")
         content = source.read_text(encoding="utf-8")
@@ -53,7 +51,7 @@ def save_artifact(
         atomic_write_text(destination, content, overwrite=False)
         return {"artifact": str(destination)}
     if kind in {"request", "rubric"}:
-        if any(run_dir.joinpath("drafts").glob("round-*.md")):
+        if layout.iter_drafts(run_dir):
             raise StateError(f"{kind}.md is immutable after the first draft")
         content = source.read_text(encoding="utf-8")
         if not content.strip():
@@ -68,15 +66,16 @@ def save_artifact(
             missing = sorted(heading for heading in required_headings if heading not in content)
             if missing:
                 raise InputError("Structured request is missing required headings", details={"missing": missing})
-            original = (run_dir / "request.original.txt").read_text(encoding="utf-8")
+            original = (layout.request_original(run_dir)).read_text(encoding="utf-8")
             if original not in content:
                 raise InputError("Structured request must preserve the exact user original")
         else:
             criteria = set(re.findall(r"\bAC-\d{2}\b", content))
             if not criteria:
                 raise InputError("rubric.md must contain at least one AC-NN criterion")
-        atomic_write_text(run_dir / f"{kind}.md", content)
-        return {"artifact": str(run_dir / f"{kind}.md")}
+        destination = layout.request(run_dir) if kind == "request" else layout.rubric(run_dir)
+        atomic_write_text(destination, content)
+        return {"artifact": str(destination)}
     if kind == "draft":
         if round_number is None:
             raise InputError("Saving a draft requires --round")
@@ -87,11 +86,11 @@ def save_artifact(
 def save_proposal(run_dir: Path, proposal: dict[str, Any]) -> Path:
     schema_path = REFERENCE_ROOT / "proposal.schema.json"
     validate_against_schema(proposal, schema_path, "proposal")
-    path = run_dir / "proposals" / "gpt.json"
+    path = layout.proposal(run_dir, "gpt.json")
     atomic_write_json(path, proposal, overwrite=False)
-    manifest = read_json(run_dir / "manifest.json")
-    manifest["state"] = "PROPOSALS_READY" if (run_dir / "proposals" / "claude.md").exists() else "GPT_PROPOSAL_READY"
-    atomic_write_json(run_dir / "manifest.json", manifest)
+    manifest = read_json(layout.manifest(run_dir))
+    manifest["state"] = "PROPOSALS_READY" if (layout.proposal(run_dir, "claude.md")).exists() else "GPT_PROPOSAL_READY"
+    atomic_write_json(layout.manifest(run_dir), manifest)
     return path
 
 
@@ -126,7 +125,7 @@ def _validate_and_apply_review(
     previous_hashes = load_hashes_for_round(run_dir, baseline_draft_round)
     current_hashes = load_hashes_for_round(run_dir, draft_round)
     allowed_criteria = set(
-        re.findall(r"\bAC-\d{2}\b", (run_dir / "rubric.md").read_text(encoding="utf-8"))
+        re.findall(r"\bAC-\d{2}\b", (layout.rubric(run_dir)).read_text(encoding="utf-8"))
     )
     validate_review_semantics(
         review,
@@ -148,7 +147,7 @@ def _validate_and_apply_review(
         source=output_path.relative_to(run_dir).as_posix(),
     )
     metrics = record_review_metrics(run_dir, round_number=review_round, stats=stats)
-    manifest = read_json(run_dir / "manifest.json")
+    manifest = read_json(layout.manifest(run_dir))
     manifest["last_review_round"] = review_round
     manifest["last_reviewed_draft_round"] = draft_round
     manifest["last_review_verdict"] = review["verdict"]
@@ -167,7 +166,7 @@ def _validate_and_apply_review(
         }
     )
     manifest["review_history"] = sorted(history, key=lambda item: int(item["review_round"]))
-    atomic_write_json(run_dir / "manifest.json", manifest)
+    atomic_write_json(layout.manifest(run_dir), manifest)
     return {"review": str(output_path), "verdict": review["verdict"], "stats": stats, "metrics": metrics}
 
 
@@ -180,18 +179,18 @@ def ingest_review(
     allow_rebuttal_similarity: bool = False,
 ) -> dict[str, Any]:
     assert_run_can_advance(run_dir, "review")
-    manifest = read_json(run_dir / "manifest.json")
+    manifest = read_json(layout.manifest(run_dir))
     expected_review_round = int(manifest.get("last_review_round", 0)) + 1
     if review_round != expected_review_round:
         raise StateError(
             f"Expected review round {expected_review_round}, received {review_round}"
         )
     draft_round = int(manifest.get("current_round", 0)) if draft_round is None else draft_round
-    draft_path = run_dir / "drafts" / f"round-{draft_round}.md"
+    draft_path = layout.draft(run_dir, draft_round)
     if not draft_path.exists():
         raise StateError(f"Review round {review_round} requires {draft_path.name}")
     baseline_draft_round = int(manifest.get("last_reviewed_draft_round", -1))
-    output_path = run_dir / "reviews" / f"round-{review_round}.json"
+    output_path = layout.review(run_dir, review_round)
     return _validate_and_apply_review(
         run_dir,
         review=review,
@@ -213,14 +212,14 @@ def run_review(
     semantic_retries: int = 2,
 ) -> tuple[ProviderResult, dict[str, Any]]:
     assert_run_can_advance(run_dir, "review")
-    manifest = read_json(run_dir / "manifest.json")
+    manifest = read_json(layout.manifest(run_dir))
     expected_review_round = int(manifest.get("last_review_round", 0)) + 1
     if review_round != expected_review_round:
         raise StateError(
             f"Expected review round {expected_review_round}, received {review_round}"
         )
     draft_round = int(manifest.get("current_round", 0)) if draft_round is None else draft_round
-    draft_path = run_dir / "drafts" / f"round-{draft_round}.md"
+    draft_path = layout.draft(run_dir, draft_round)
     if not draft_path.exists():
         raise StateError(f"Review round {review_round} requires {draft_path.name}")
     build_feedback_cards(run_dir, draft_path)
@@ -264,15 +263,15 @@ def run_review(
                 review_round=review_round,
                 draft_round=draft_round,
                 baseline_draft_round=baseline_draft_round,
-                output_path=run_dir / "reviews" / f"round-{review_round}.json",
+                output_path=layout.review(run_dir, review_round),
                 allow_rebuttal_similarity=semantic_attempt >= 2,
             )
             if semantic_attempt >= 2:
-                convergence = read_json(run_dir / "convergence.json")
+                convergence = read_json(layout.convergence(run_dir))
                 for record in convergence["rounds"]:
                     if record["round"] == review_round:
                         record["semantic_validation_bypass"].append("response_to_rebuttal_similarity")
-                atomic_write_json(run_dir / "convergence.json", convergence)
+                atomic_write_json(layout.convergence(run_dir), convergence)
             record_provider_call(
                 run_dir,
                 provider="codex",
@@ -292,10 +291,10 @@ def run_review(
                 outcome="VALIDATION_RETRY",
                 error=exc.message,
             )
-            manifest = read_json(run_dir / "manifest.json")
+            manifest = read_json(layout.manifest(run_dir))
             key = "semantic" if isinstance(exc, SemanticValidationError) else "schema"
             manifest["retries"][key] += 1
-            atomic_write_json(run_dir / "manifest.json", manifest)
+            atomic_write_json(layout.manifest(run_dir), manifest)
             record_retry_event(
                 run_dir,
                 retry_type=key,
@@ -315,11 +314,11 @@ def run_review(
 
 def promote_final_findings(run_dir: Path) -> dict[str, Any]:
     assert_run_can_advance(run_dir, "promote-final")
-    reconciliation = read_json(run_dir / "final-reconciliation.json", default={})
+    reconciliation = read_json(layout.final_reconciliation(run_dir), default={})
     findings = reconciliation.get("unaccepted_blocking_findings", [])
     if not findings:
         raise StateError("There are no unaccepted FINAL_BLIND findings to promote")
-    manifest = read_json(run_dir / "manifest.json")
+    manifest = read_json(layout.manifest(run_dir))
     if int(manifest.get("last_review_round", 0)) >= int(manifest["limits"]["review_rounds"]):
         raise StateError("Cannot promote FINAL_BLIND findings after the review round limit")
     draft_round, _ = current_draft(run_dir)
@@ -333,7 +332,7 @@ def promote_final_findings(run_dir: Path) -> dict[str, Any]:
         "questions_for_user": [],
         "nonblocking_risks": [],
     }
-    output_path = run_dir / "reviews" / f"final-promoted-round-{review_round}.json"
+    output_path = layout.promoted(run_dir, review_round)
     return _validate_and_apply_review(
         run_dir,
         review=review,

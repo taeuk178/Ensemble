@@ -12,6 +12,7 @@ from .io_utils import atomic_write_json, atomic_write_text, read_json
 from .providers import run_agy, run_codex
 from .registry import load_registry, write_reviewer_projection
 from .state_machine import record_provider_call
+from . import layout
 
 
 def run_panel(
@@ -30,7 +31,7 @@ def run_panel(
         raise InputError(f"Unknown issue ID: {issue_id}")
     issue = registry[issue_id]
     author_history = issue.get("author_disposition_history") or []
-    manifest = read_json(run_dir / "manifest.json")
+    manifest = read_json(layout.manifest(run_dir))
     pending_panel = set(manifest.get("pending_panel_issue_ids", []))
     if issue_id not in pending_panel:
         raise StateError("Panel escalation requires an issue selected by the escalation controller")
@@ -40,8 +41,8 @@ def run_panel(
     if panel_count >= int(manifest["limits"]["panel_calls"]):
         raise StateError("Panel call limit reached")
     draft_round = int(manifest.get("current_round", 0))
-    draft_path = run_dir / "drafts" / f"round-{draft_round}.md"
-    panel_dir = run_dir / "panel" / issue_id
+    draft_path = layout.draft(run_dir, draft_round)
+    panel_dir = layout.panel_issue(run_dir, issue_id)
     if panel_dir.exists():
         raise StateError(f"Panel artifact already exists for {issue_id}")
     panel_dir.mkdir(parents=True)
@@ -84,15 +85,15 @@ def run_panel(
                 result=agy,
             )
         except InfraError:
-            manifest = read_json(run_dir / "manifest.json")
+            manifest = read_json(layout.manifest(run_dir))
             issue["status"] = "BILATERAL_DEADLOCK"
             manifest["state"] = "USER_DECISION_REQUIRED"
             pending = set(manifest.get("pending_user_issue_ids", []))
             pending.add(issue_id)
             manifest["pending_user_issue_ids"] = sorted(pending)
             manifest["panel_call_count"] = panel_count + 1
-            atomic_write_json(run_dir / "issue-registry.json", registry)
-            atomic_write_json(run_dir / "manifest.json", manifest)
+            atomic_write_json(layout.registry(run_dir), registry)
+            atomic_write_json(layout.manifest(run_dir), manifest)
             raise
         evaluations["agy"] = agy.payload
         atomic_write_json(panel_dir / "agy.json", agy.payload, overwrite=False)
@@ -134,7 +135,7 @@ def run_panel(
             result=agy_revote_result,
         )
         agy_revote = agy_revote_result.payload
-    manifest = read_json(run_dir / "manifest.json")
+    manifest = read_json(layout.manifest(run_dir))
     atomic_write_json(revotes_dir / "gpt.json", gpt_revote, overwrite=False)
     atomic_write_json(revotes_dir / "agy.json", agy_revote, overwrite=False)
     severities = [int(gpt_revote["severity"]), int(agy_revote["severity"])]
@@ -176,7 +177,7 @@ def run_panel(
         }
     )
     manifest["panel_call_count"] = panel_count + 1
-    atomic_write_json(run_dir / "issue-registry.json", registry)
-    atomic_write_json(run_dir / "manifest.json", manifest)
+    atomic_write_json(layout.registry(run_dir), registry)
+    atomic_write_json(layout.manifest(run_dir), manifest)
     write_reviewer_projection(run_dir, registry)
     return {"issue_id": issue_id, "outcome": outcome, "severities": severities, "panel_dir": str(panel_dir)}

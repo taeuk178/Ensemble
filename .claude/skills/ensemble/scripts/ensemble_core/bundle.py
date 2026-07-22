@@ -18,6 +18,7 @@ from .config import (
 )
 from .errors import SecurityError, StateError
 from .io_utils import atomic_write_json, ensure_within
+from . import layout
 
 
 MODE_ALLOWLISTS = {
@@ -45,7 +46,7 @@ def prepare_review_session_bundle(
     """Refresh the stable, request-scoped workspace used by a resumed review session."""
     if len(request_hash) != 64 or any(character not in "0123456789abcdef" for character in request_hash):
         raise SecurityError("검토 세션의 요청 해시가 올바르지 않습니다.")
-    sessions_dir = run_dir / "review-sessions"
+    sessions_dir = layout.review_sessions_dir(run_dir)
     sessions_dir.mkdir(parents=True, exist_ok=True)
     if sessions_dir.is_symlink():
         raise SecurityError("검토 세션 폴더는 심볼릭 링크일 수 없습니다.")
@@ -63,15 +64,15 @@ def prepare_review_session_bundle(
     if unsafe:
         raise SecurityError(f"검토 세션 폴더에 안전하지 않은 파일이 있습니다: {unsafe}")
     sources = {
-        "request.md": run_dir / "request.md",
-        "rubric.md": run_dir / "rubric.md",
+        "request.md": layout.request(run_dir),
+        "rubric.md": layout.rubric(run_dir),
         "draft.md": draft_path,
-        "reviewer-issue-index.json": run_dir / "reviewer-issue-index.json",
-        "feedback-cards.md": run_dir / "feedback-cards.md",
+        "reviewer-issue-index.json": layout.reviewer_index(run_dir),
+        "feedback-cards.md": layout.feedback_cards(run_dir),
     }
     for name, source in sources.items():
         _copy_checked(source, bundle_dir / name, run_dir)
-    audit_path = run_dir / "bundles" / f"{uuid.uuid4().hex}.json"
+    audit_path = layout.bundles_dir(run_dir) / f"{uuid.uuid4().hex}.json"
     atomic_write_json(
         audit_path,
         {
@@ -99,17 +100,17 @@ def isolated_bundle(
     allowlist = MODE_ALLOWLISTS[mode]
     with tempfile.TemporaryDirectory(prefix=f"ensemble-{mode}-") as temporary:
         bundle_dir = Path(temporary)
-        _copy_checked(run_dir / "request.md", bundle_dir / "request.md", run_dir)
-        _copy_checked(run_dir / "rubric.md", bundle_dir / "rubric.md", run_dir)
+        _copy_checked(layout.request(run_dir), bundle_dir / "request.md", run_dir)
+        _copy_checked(layout.rubric(run_dir), bundle_dir / "rubric.md", run_dir)
         if draft_path is not None:
             _copy_checked(draft_path, bundle_dir / "draft.md", run_dir)
         if mode == "review":
             _copy_checked(
-                run_dir / "reviewer-issue-index.json",
+                layout.reviewer_index(run_dir),
                 bundle_dir / "reviewer-issue-index.json",
                 run_dir,
             )
-            _copy_checked(run_dir / "feedback-cards.md", bundle_dir / "feedback-cards.md", run_dir)
+            _copy_checked(layout.feedback_cards(run_dir), bundle_dir / "feedback-cards.md", run_dir)
         if mode == "panel":
             if issue is None:
                 raise StateError("추가 판단에는 이슈 하나가 필요합니다.")
@@ -128,6 +129,6 @@ def isolated_bundle(
             raise SecurityError(f"Bundle contains non-whitelisted files: {sorted(names - allowlist)}")
         if names & FORBIDDEN_REVIEW_FILES:
             raise SecurityError(f"Bundle contains forbidden files: {sorted(names & FORBIDDEN_REVIEW_FILES)}")
-        audit_path = run_dir / "bundles" / f"{uuid.uuid4().hex}.json"
+        audit_path = layout.bundles_dir(run_dir) / f"{uuid.uuid4().hex}.json"
         atomic_write_json(audit_path, {"mode": mode, "files": sorted(names)})
         yield bundle_dir

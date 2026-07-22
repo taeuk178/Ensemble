@@ -7,6 +7,7 @@ from typing import Any
 from .config import OPEN_STATUSES
 from .io_utils import atomic_write_json, read_json, utc_now
 from .registry import load_registry
+from . import layout
 
 
 def _latest_author_dispositions(registry: dict[str, Any]) -> dict[str, str | None]:
@@ -98,7 +99,7 @@ def _author_deadlocks(registry: dict[str, Any]) -> list[str]:
 
 def record_review_metrics(run_dir: Path, *, round_number: int, stats: dict[str, Any]) -> dict[str, Any]:
     registry = load_registry(run_dir)
-    convergence = read_json(run_dir / "convergence.json", default={"rounds": [], "events": []})
+    convergence = read_json(layout.convergence(run_dir), default={"rounds": [], "events": []})
     rounds = [record for record in convergence["rounds"] if record.get("round") != round_number]
     open_ids = sorted(
         issue_id for issue_id, issue in registry.items() if issue.get("status") in OPEN_STATUSES
@@ -130,13 +131,13 @@ def record_review_metrics(run_dir: Path, *, round_number: int, stats: dict[str, 
     rounds.sort(key=lambda item: int(item["round"]))
     _recompute_stall(rounds)
     convergence["rounds"] = rounds
-    atomic_write_json(run_dir / "convergence.json", convergence)
+    atomic_write_json(layout.convergence(run_dir), convergence)
     return next(item for item in rounds if item["round"] == round_number)
 
 
 def refresh_author_dispositions(run_dir: Path, round_number: int) -> None:
     registry = load_registry(run_dir)
-    convergence = read_json(run_dir / "convergence.json", default={"rounds": [], "events": []})
+    convergence = read_json(layout.convergence(run_dir), default={"rounds": [], "events": []})
     for record in convergence["rounds"]:
         if record.get("round") == round_number:
             record["author_dispositions"] = _latest_author_dispositions(registry)
@@ -156,9 +157,9 @@ def refresh_author_dispositions(run_dir: Path, round_number: int) -> None:
         key = (signal.get("type"), signal.get("issue_id"), signal.get("round"))
         if key not in existing:
             convergence["events"].append({**signal, "recorded_at": utc_now()})
-    atomic_write_json(run_dir / "convergence.json", convergence)
+    atomic_write_json(layout.convergence(run_dir), convergence)
     if signals:
-        manifest = read_json(run_dir / "manifest.json")
+        manifest = read_json(layout.manifest(run_dir))
         phase_three = str(manifest.get("phase")) == "3"
         manifest["state"] = "ESCALATION_REQUIRED" if phase_three else "USER_DECISION_REQUIRED"
         manifest["escalation_signals"] = signals
@@ -170,16 +171,15 @@ def refresh_author_dispositions(run_dir: Path, round_number: int) -> None:
                 if signal.get("type") == "AUTHOR_DEADLOCK" and signal.get("issue_id")
             )
             manifest["pending_panel_issue_ids"] = sorted(pending)
-        atomic_write_json(run_dir / "manifest.json", manifest)
+        atomic_write_json(layout.manifest(run_dir), manifest)
 
 
 def record_draft_oscillation(run_dir: Path, round_number: int, hashes: dict[str, str]) -> dict[str, Any]:
-    convergence = read_json(run_dir / "convergence.json", default={"rounds": [], "events": []})
+    convergence = read_json(layout.convergence(run_dir), default={"rounds": [], "events": []})
     history: dict[str, list[tuple[int, str]]] = {}
-    hashes_dir = run_dir / "hashes"
-    for path in sorted(hashes_dir.glob("round-*.json")):
+    for path in layout.iter_hashes(run_dir):
         try:
-            number = int(path.stem.split("-", 1)[1])
+            number = layout.round_of(path)
         except ValueError:
             continue
         if number >= round_number:
@@ -210,7 +210,7 @@ def record_draft_oscillation(run_dir: Path, round_number: int, hashes: dict[str,
             convergence["events"].append(event)
             counts[section] += 1
             oscillating_sections.append(section)
-    atomic_write_json(run_dir / "convergence.json", convergence)
+    atomic_write_json(layout.convergence(run_dir), convergence)
     return {
         "sections": oscillating_sections,
         "terminate": any(counts[section] >= 2 for section in oscillating_sections),

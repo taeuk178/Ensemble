@@ -19,6 +19,7 @@ from .config import (
 from .environment import ensemble_source_hash, environment_snapshot
 from .errors import InputError, StateError
 from .hashing import evidence_ref_hashes, section_hashes
+from . import layout
 from .io_utils import (
     atomic_write_json,
     atomic_write_text,
@@ -110,28 +111,21 @@ def initialize_run(
     run_dir = RUNS_ROOT / run_id
     if run_dir.exists():
         raise StateError(f"실행 ID가 겹쳤습니다: {run_id}")
-    for relative in (
-        "proposals",
-        "drafts",
-        "reviews",
-        "panel",
-        "hashes",
-        "bundles",
-    ):
+    for relative in layout.RUN_SUBDIRS:
         (run_dir / relative).mkdir(parents=True, exist_ok=False)
-    atomic_write_text(run_dir / "request.md", render_request(request), overwrite=False)
+    atomic_write_text(layout.request(run_dir), render_request(request), overwrite=False)
     atomic_write_text(
-        run_dir / "request.original.txt",
+        layout.request_original(run_dir),
         request,
         overwrite=False,
         ensure_trailing_newline=False,
     )
-    atomic_write_text(run_dir / "rubric.md", render_rubric(), overwrite=False)
-    atomic_write_json(run_dir / "issue-registry.json", {}, overwrite=False)
-    atomic_write_json(run_dir / "reviewer-issue-index.json", [], overwrite=False)
-    atomic_write_json(run_dir / "convergence.json", {"rounds": [], "events": []}, overwrite=False)
-    atomic_write_text(run_dir / "feedback-cards.md", "# 이슈 검토 자료\n", overwrite=False)
-    atomic_write_text(run_dir / "decisions.md", "# Decisions\n", overwrite=False)
+    atomic_write_text(layout.rubric(run_dir), render_rubric(), overwrite=False)
+    atomic_write_json(layout.registry(run_dir), {}, overwrite=False)
+    atomic_write_json(layout.reviewer_index(run_dir), [], overwrite=False)
+    atomic_write_json(layout.convergence(run_dir), {"rounds": [], "events": []}, overwrite=False)
+    atomic_write_text(layout.feedback_cards(run_dir), "# 이슈 검토 자료\n", overwrite=False)
+    atomic_write_text(layout.decisions(run_dir), "# Decisions\n", overwrite=False)
     manifest = {
         "schema_version": 1,
         "run_id": run_id,
@@ -172,20 +166,20 @@ def initialize_run(
         "pending_panel_issue_ids": [],
         "escalation_signals": [],
     }
-    atomic_write_json(run_dir / "manifest.json", manifest, overwrite=False)
+    atomic_write_json(layout.manifest(run_dir), manifest, overwrite=False)
     return run_dir
 
 
 def update_manifest(run_dir: Path, **changes: Any) -> dict[str, Any]:
-    manifest = read_json(run_dir / "manifest.json")
+    manifest = read_json(layout.manifest(run_dir))
     manifest.update(changes)
-    atomic_write_json(run_dir / "manifest.json", manifest)
+    atomic_write_json(layout.manifest(run_dir), manifest)
     return manifest
 
 
 def verified_request_hash(run_dir: Path) -> str:
-    manifest = read_json(run_dir / "manifest.json")
-    original = (run_dir / "request.original.txt").read_text(encoding="utf-8")
+    manifest = read_json(layout.manifest(run_dir))
+    original = (layout.request_original(run_dir)).read_text(encoding="utf-8")
     actual = sha256_text(original)
     expected = str(manifest.get("request_hash") or "")
     if not expected or actual != expected:
@@ -194,7 +188,7 @@ def verified_request_hash(run_dir: Path) -> str:
 
 
 def load_codex_review_session(run_dir: Path) -> dict[str, Any] | None:
-    manifest = read_json(run_dir / "manifest.json")
+    manifest = read_json(layout.manifest(run_dir))
     request_hash = verified_request_hash(run_dir)
     session = manifest.get("codex_review_session")
     if not session:
@@ -221,7 +215,7 @@ def record_codex_review_session(
 ) -> dict[str, Any]:
     if not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", session_id):
         raise StateError("Codex 검토 세션 ID 형식이 올바르지 않습니다.")
-    manifest = read_json(run_dir / "manifest.json")
+    manifest = read_json(layout.manifest(run_dir))
     request_hash = verified_request_hash(run_dir)
     workspace_resolved = workspace.resolve()
     run_resolved = run_dir.resolve()
@@ -255,12 +249,12 @@ def record_codex_review_session(
         "updated_at": utc_now(),
     }
     manifest["codex_review_session"] = record
-    atomic_write_json(run_dir / "manifest.json", manifest)
+    atomic_write_json(layout.manifest(run_dir), manifest)
     return record
 
 
 def assert_run_can_advance(run_dir: Path, action: str) -> dict[str, Any]:
-    manifest = read_json(run_dir / "manifest.json")
+    manifest = read_json(layout.manifest(run_dir))
     state = str(manifest.get("state"))
     if state in PAUSED_STATES:
         raise StateError(
@@ -273,7 +267,7 @@ def assert_run_can_advance(run_dir: Path, action: str) -> dict[str, Any]:
 
 
 def assert_source_unchanged(run_dir: Path) -> None:
-    manifest = read_json(run_dir / "manifest.json")
+    manifest = read_json(layout.manifest(run_dir))
     baseline = (manifest.get("environment") or {}).get("ensemble_source_hash")
     if not baseline:
         return
@@ -286,7 +280,7 @@ def assert_source_unchanged(run_dir: Path) -> None:
     manifest.setdefault("environment_changes", []).append(
         {"recorded_at": utc_now(), "expected_source_hash": baseline, "actual_source_hash": current}
     )
-    atomic_write_json(run_dir / "manifest.json", manifest)
+    atomic_write_json(layout.manifest(run_dir), manifest)
     raise StateError(
         "실행 중 Ensemble 코드가 바뀌었습니다. 결과가 섞이지 않도록 새 실행을 시작해 주세요.",
         details={"state": "RUN_TAINTED", "expected": baseline, "actual": current},
@@ -303,7 +297,7 @@ def record_provider_call(
     outcome: str = "SUCCESS",
     error: str | None = None,
 ) -> None:
-    manifest = read_json(run_dir / "manifest.json")
+    manifest = read_json(layout.manifest(run_dir))
     model = manifest.setdefault("models", {}).setdefault(provider, {})
     model["actual"] = result.model
     model["cli_version"] = result.version
@@ -332,7 +326,7 @@ def record_provider_call(
         kind = "schema" if attempt_error.get("kind") == "schema" else "infra"
         manifest.setdefault("retries", {}).setdefault(kind, 0)
         manifest["retries"][kind] += 1
-    atomic_write_json(run_dir / "manifest.json", manifest)
+    atomic_write_json(layout.manifest(run_dir), manifest)
 
 
 def record_retry_event(
@@ -344,7 +338,7 @@ def record_retry_event(
     attempt: int,
     error: str,
 ) -> None:
-    manifest = read_json(run_dir / "manifest.json")
+    manifest = read_json(layout.manifest(run_dir))
     manifest.setdefault("retry_events", []).append(
         {
             "recorded_at": utc_now(),
@@ -355,7 +349,7 @@ def record_retry_event(
             "error": error,
         }
     )
-    atomic_write_json(run_dir / "manifest.json", manifest)
+    atomic_write_json(layout.manifest(run_dir), manifest)
 
 
 def record_provider_failure(
@@ -367,7 +361,7 @@ def record_provider_failure(
     error: str,
 ) -> None:
     provider = str(details.get("provider") or "codex")
-    manifest = read_json(run_dir / "manifest.json")
+    manifest = read_json(layout.manifest(run_dir))
     model = manifest.setdefault("models", {}).setdefault(provider, {})
     if details.get("model"):
         model["actual"] = details["model"]
@@ -393,11 +387,11 @@ def record_provider_failure(
             "error": error,
         }
     )
-    atomic_write_json(run_dir / "manifest.json", manifest)
+    atomic_write_json(layout.manifest(run_dir), manifest)
 
 
 def resolve_user_decision(run_dir: Path, *, action: str, note: str) -> dict[str, Any]:
-    manifest = read_json(run_dir / "manifest.json")
+    manifest = read_json(layout.manifest(run_dir))
     from_state = str(manifest.get("state"))
     if from_state not in PAUSED_STATES:
         raise StateError(f"현재 상태 {from_state}에서는 사용자 결정으로 재개할 필요가 없습니다.")
@@ -418,8 +412,8 @@ def resolve_user_decision(run_dir: Path, *, action: str, note: str) -> dict[str,
     manifest["escalation_signals"] = []
     manifest["pending_user_issue_ids"] = []
     manifest["pending_panel_issue_ids"] = []
-    atomic_write_json(run_dir / "manifest.json", manifest)
-    decisions_path = run_dir / "decisions.md"
+    atomic_write_json(layout.manifest(run_dir), manifest)
+    decisions_path = layout.decisions(run_dir)
     existing = decisions_path.read_text(encoding="utf-8").rstrip()
     section = (
         f"\n\n## 사용자 결정 {event['recorded_at']}\n\n"
@@ -432,17 +426,17 @@ def resolve_user_decision(run_dir: Path, *, action: str, note: str) -> dict[str,
 
 
 def add_manifest_warning(run_dir: Path, warning: str) -> None:
-    manifest = read_json(run_dir / "manifest.json")
+    manifest = read_json(layout.manifest(run_dir))
     if warning not in manifest["warnings"]:
         manifest["warnings"].append(warning)
-    atomic_write_json(run_dir / "manifest.json", manifest)
+    atomic_write_json(layout.manifest(run_dir), manifest)
 
 
 def register_draft(run_dir: Path, source: Path, round_number: int) -> dict[str, Any]:
     assert_run_can_advance(run_dir, "save draft")
     if round_number < 0:
         raise InputError("초안 번호는 0 이상이어야 합니다.")
-    destination = run_dir / "drafts" / f"round-{round_number}.md"
+    destination = layout.draft(run_dir, round_number)
     if destination.exists():
         raise StateError(f"같은 번호의 초안이 이미 있습니다: {destination.name}")
     content = source.read_text(encoding="utf-8")
@@ -450,18 +444,18 @@ def register_draft(run_dir: Path, source: Path, round_number: int) -> dict[str, 
         raise InputError("빈 초안은 저장할 수 없습니다.")
     atomic_write_text(destination, content, overwrite=False)
     hashes = section_hashes(content)
-    atomic_write_json(run_dir / "hashes" / f"round-{round_number}.json", hashes, overwrite=False)
+    atomic_write_json(layout.hashes(run_dir, round_number), hashes, overwrite=False)
     invalidated = invalidate_accepted_risks(run_dir, content, round_number)
     from .convergence import record_draft_oscillation
 
     oscillation = record_draft_oscillation(run_dir, round_number, hashes)
-    manifest = read_json(run_dir / "manifest.json")
+    manifest = read_json(layout.manifest(run_dir))
     manifest["current_round"] = max(int(manifest.get("current_round", 0)), round_number)
     manifest["state"] = "OSCILLATING" if oscillation["terminate"] else "DRAFT_READY"
     if oscillation["terminate"]:
         manifest["termination_reason"] = "The same section oscillated for the second time"
         manifest["finished_at"] = utc_now()
-    atomic_write_json(run_dir / "manifest.json", manifest)
+    atomic_write_json(layout.manifest(run_dir), manifest)
     return {
         "draft": str(destination),
         "round": round_number,
@@ -471,7 +465,7 @@ def register_draft(run_dir: Path, source: Path, round_number: int) -> dict[str, 
 
 
 def invalidate_accepted_risks(run_dir: Path, markdown: str, round_number: int) -> list[str]:
-    registry_path = run_dir / "issue-registry.json"
+    registry_path = layout.registry(run_dir)
     registry = read_json(registry_path, default={})
     invalidated: list[str] = []
     for issue_id, issue in registry.items():

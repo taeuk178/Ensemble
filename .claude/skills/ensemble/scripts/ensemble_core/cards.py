@@ -7,6 +7,7 @@ from .errors import SemanticValidationError
 from .hashing import canonical_section_ref, parse_sections, resolve_ref_slugs
 from .io_utils import atomic_write_text
 from .registry import load_registry
+from . import layout
 
 
 FORBIDDEN_CARD_TERMS = {
@@ -67,7 +68,7 @@ def build_feedback_cards(run_dir: Path, draft_path: Path) -> str:
         raise SemanticValidationError(
             "Feedback card contains forbidden anchored metrics", details={"terms": leaked}
         )
-    atomic_write_text(run_dir / "feedback-cards.md", rendered)
+    atomic_write_text(layout.feedback_cards(run_dir), rendered)
     return rendered
 
 

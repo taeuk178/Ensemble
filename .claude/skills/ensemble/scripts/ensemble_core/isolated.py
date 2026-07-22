@@ -11,6 +11,7 @@ from .io_utils import atomic_write_json, read_json
 from .providers import ProviderResult, run_codex
 from .registry import load_registry
 from .validation import validate_against_schema, validate_review_schema
+from . import layout
 
 
 def reconcile_final_findings(
@@ -81,21 +82,20 @@ def save_final_assessment(
             raise SemanticValidationError("FINAL_BLIND findings must use id: null")
         if issue["severity"] < 3:
             raise SemanticValidationError("최종 독립 검토의 진행 차단 이슈는 중요도가 3~5여야 합니다.")
-    draft_round = int(draft_path.stem.split("-", 1)[1])
-    base_name = f"final-blind-round-{draft_round}"
-    existing = sorted((run_dir / "reviews").glob(f"{base_name}*.json"))
+    draft_round = layout.round_of(draft_path)
+    existing = layout.iter_blind_attempts(run_dir, draft_round)
     suffix = "" if not existing else f"-attempt-{len(existing) + 1}"
-    raw_path = run_dir / "reviews" / f"{base_name}{suffix}.json"
+    raw_path = layout.blind(run_dir, draft_round, suffix)
     atomic_write_json(raw_path, raw_review, overwrite=False)
     reconciliation = reconcile_final_findings(run_dir, draft_path=draft_path, raw_review=raw_review)
     reconciliation.update({"raw_review_path": str(raw_path), "draft": str(draft_path)})
-    detail_path = run_dir / "reviews" / f"final-reconciliation-round-{draft_round}{suffix}.json"
+    detail_path = layout.reconciliation(run_dir, draft_round, suffix)
     atomic_write_json(detail_path, reconciliation, overwrite=False)
-    atomic_write_json(run_dir / "final-reconciliation.json", reconciliation)
-    manifest = read_json(run_dir / "manifest.json")
+    atomic_write_json(layout.final_reconciliation(run_dir), reconciliation)
+    manifest = read_json(layout.manifest(run_dir))
     manifest["latest_final_blind"] = str(raw_path)
     manifest["latest_final_reconciliation"] = str(detail_path)
-    atomic_write_json(run_dir / "manifest.json", manifest)
+    atomic_write_json(layout.manifest(run_dir), manifest)
     return reconciliation
 
 

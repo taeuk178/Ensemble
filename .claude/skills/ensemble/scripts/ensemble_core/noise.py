@@ -13,6 +13,7 @@ from .providers import run_codex
 from .validation import validate_review_schema
 from .workflow import current_draft
 from .state_machine import record_provider_call
+from . import layout
 
 
 def _observation(markdown: str, issue: dict[str, Any], *, blocking: bool, salt: str) -> dict[str, Any]:
@@ -127,7 +128,7 @@ def measure_noise(
         "pairs": pairs,
         "interpretation": "Approximation with possible false matches and false mismatches; not a lower or upper bound.",
     }
-    noise_dir = run_dir / "noise"
+    noise_dir = layout.noise_dir(run_dir)
     noise_dir.mkdir(exist_ok=True)
     existing = list(noise_dir.glob("measurement-*.json"))
     output = noise_dir / f"measurement-{len(existing) + 1}.json"

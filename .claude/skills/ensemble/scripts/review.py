@@ -20,6 +20,7 @@ from ensemble_core.audit import apply_audit, run_issue_audit
 from ensemble_core.convergence import refresh_author_dispositions, reproducibility_metrics
 from ensemble_core.errors import EnsembleError, InfraError, InputError, SchemaError
 from ensemble_core.history import write_timeline
+from ensemble_core import layout
 from ensemble_core.io_utils import (
     detect_sensitive_text,
     parse_answer_section,
@@ -84,14 +85,14 @@ def panel_model_record(manifest: dict[str, Any]) -> dict[str, Any]:
 
 
 def manifest_models(run_dir: Path, args: argparse.Namespace) -> tuple[str, str]:
-    manifest = read_json(run_dir / "manifest.json")
+    manifest = read_json(layout.manifest(run_dir))
     review_model = getattr(args, "model", None) or manifest["models"]["codex"]["requested"]
     panel_model = getattr(args, "panel_model", None) or panel_model_record(manifest)["requested"]
     return review_model, panel_model
 
 
 def manifest_panel_effort(run_dir: Path, args: argparse.Namespace) -> str:
-    manifest = read_json(run_dir / "manifest.json")
+    manifest = read_json(layout.manifest(run_dir))
     return (
         getattr(args, "panel_effort", None)
         or panel_model_record(manifest).get("requested_reasoning_effort")
@@ -131,7 +132,7 @@ def command_init(args: argparse.Namespace) -> dict[str, Any]:
         max_panel_calls=args.max_panel_calls,
         allow_reuse=args.allow_reuse,
     )
-    manifest = read_json(run_dir / "manifest.json")
+    manifest = read_json(layout.manifest(run_dir))
     environment = manifest.get("environment", {})
     for provider in ("codex", "agy"):
         info = environment.get(provider, {})
@@ -143,12 +144,12 @@ def command_init(args: argparse.Namespace) -> dict[str, Any]:
         )
     from ensemble_core.io_utils import atomic_write_json
 
-    atomic_write_json(run_dir / "manifest.json", manifest)
+    atomic_write_json(layout.manifest(run_dir), manifest)
     return {
         "run_id": manifest["run_id"],
         "run_dir": str(run_dir),
-        "request": str(run_dir / "request.md"),
-        "rubric": str(run_dir / "rubric.md"),
+        "request": str(layout.request(run_dir)),
+        "rubric": str(layout.rubric(run_dir)),
         "notice": "request.md, rubric.md, draft는 OpenAI에 전송될 수 있고 패널 사용 시 쟁점이 Google에 전송될 수 있습니다.",
         "warnings": manifest["warnings"],
     }
@@ -171,7 +172,7 @@ def command_preflight(args: argparse.Namespace) -> dict[str, Any]:
         panel_effort=panel_effort,
     )
     if run_dir:
-        manifest = read_json(run_dir / "manifest.json")
+        manifest = read_json(layout.manifest(run_dir))
         manifest["models"]["codex"]["cli_version"] = result["codex"]["version"]
         manifest["models"]["codex"]["command_path"] = result["codex"]["path"]
         manifest["models"]["codex"]["requested_reasoning_effort"] = result["codex"]["reasoning_effort"]
@@ -181,7 +182,7 @@ def command_preflight(args: argparse.Namespace) -> dict[str, Any]:
         agy_model["requested_reasoning_effort"] = panel_effort
         from ensemble_core.io_utils import atomic_write_json
 
-        atomic_write_json(run_dir / "manifest.json", manifest)
+        atomic_write_json(layout.manifest(run_dir), manifest)
     return result
 
 
@@ -213,7 +214,7 @@ def command_review(args: argparse.Namespace) -> dict[str, Any]:
     run_dir = resolve_run(args.run)
     assert_run_can_advance(run_dir, "review")
     assert_source_unchanged(run_dir)
-    manifest = read_json(run_dir / "manifest.json")
+    manifest = read_json(layout.manifest(run_dir))
     if manifest.get("phase") == "1A" and args.round != 1:
         raise InputError("Phase 1A supports exactly one normal review round")
     if args.round > int(manifest["limits"]["review_rounds"]):
@@ -272,14 +273,14 @@ def command_decision(args: argparse.Namespace) -> dict[str, Any]:
     )
     refresh_author_dispositions(run_dir, int(payload["round"]))
     if payload["disposition"] == "DEFER":
-        manifest = read_json(run_dir / "manifest.json")
+        manifest = read_json(layout.manifest(run_dir))
         manifest["state"] = "USER_DECISION_REQUIRED"
         pending = set(manifest.get("pending_user_issue_ids", []))
         pending.add(payload["issue_id"])
         manifest["pending_user_issue_ids"] = sorted(pending)
         from ensemble_core.io_utils import atomic_write_json
 
-        atomic_write_json(run_dir / "manifest.json", manifest)
+        atomic_write_json(layout.manifest(run_dir), manifest)
     return {"recorded": payload["issue_id"], "disposition": payload["disposition"]}
 
 
@@ -294,7 +295,7 @@ def command_accept_risk(args: argparse.Namespace) -> dict[str, Any]:
         note=note,
         round_number=args.round,
     )
-    manifest = read_json(run_dir / "manifest.json")
+    manifest = read_json(layout.manifest(run_dir))
     pending = set(manifest.get("pending_user_issue_ids", []))
     pending.discard(args.issue)
     manifest["pending_user_issue_ids"] = sorted(pending)
@@ -302,7 +303,7 @@ def command_accept_risk(args: argparse.Namespace) -> dict[str, Any]:
         manifest["state"] = "DRAFT_READY"
     from ensemble_core.io_utils import atomic_write_json
 
-    atomic_write_json(run_dir / "manifest.json", manifest)
+    atomic_write_json(layout.manifest(run_dir), manifest)
     return {"issue_id": args.issue, "status": issue["status"], "gating": issue["gating"]}
 
 
@@ -328,7 +329,7 @@ def command_final_blind(args: argparse.Namespace) -> dict[str, Any]:
         run_dir,
         provider="codex",
         operation="final-blind",
-        round_number=int(read_json(run_dir / "manifest.json").get("current_round", 0)),
+        round_number=int(read_json(layout.manifest(run_dir)).get("current_round", 0)),
         result=result,
     )
     reconciliation["provider_attempts"] = result.attempts
@@ -344,7 +345,7 @@ def command_promote_final(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_panel(args: argparse.Namespace) -> dict[str, Any]:
     run_dir = resolve_run(args.run)
-    manifest = read_json(run_dir / "manifest.json")
+    manifest = read_json(layout.manifest(run_dir))
     if manifest.get("phase") != "3":
         raise InputError("Panel evaluation is available only in phase 3")
     if manifest.get("state") != "ESCALATION_REQUIRED":
@@ -368,9 +369,9 @@ def command_finalize(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_status(args: argparse.Namespace) -> dict[str, Any]:
     run_dir = resolve_run(args.run)
-    manifest = read_json(run_dir / "manifest.json")
+    manifest = read_json(layout.manifest(run_dir))
     registry = load_registry(run_dir)
-    convergence = read_json(run_dir / "convergence.json")
+    convergence = read_json(layout.convergence(run_dir))
     return {
         "run_dir": str(run_dir),
         "state": manifest["state"],
@@ -386,7 +387,7 @@ def command_status(args: argparse.Namespace) -> dict[str, Any]:
         "warnings": manifest.get("warnings", []),
         "escalation_signals": manifest.get("escalation_signals", []),
         "pending_panel_issue_ids": manifest.get("pending_panel_issue_ids", []),
-        "timeline": str(run_dir / "timeline.md"),
+        "timeline": str(layout.timeline(run_dir)),
     }
 
 
@@ -422,7 +423,7 @@ def command_measure_noise(args: argparse.Namespace) -> dict[str, Any]:
 
 def command_issue_audit(args: argparse.Namespace) -> dict[str, Any]:
     run_dir = resolve_run(args.run)
-    if read_json(run_dir / "manifest.json").get("phase") != "3":
+    if read_json(layout.manifest(run_dir)).get("phase") != "3":
         raise InputError("ISSUE_AUDIT is available only in phase 3")
     assert_source_unchanged(run_dir)
     if args.input:
@@ -604,14 +605,14 @@ def main() -> int:
         if run_value:
             try:
                 run_dir = resolve_run(run_value)
-                manifest = read_json(run_dir / "manifest.json")
+                manifest = read_json(layout.manifest(run_dir))
                 if isinstance(exc.details, dict) and isinstance(exc.details.get("attempts"), int):
                     retry_key = "schema" if isinstance(exc, SchemaError) else "infra"
                     retry_count = max(int(exc.details["attempts"]) - 1, 0)
                     manifest["retries"][retry_key] += retry_count
                     from ensemble_core.io_utils import atomic_write_json
 
-                    atomic_write_json(run_dir / "manifest.json", manifest)
+                    atomic_write_json(layout.manifest(run_dir), manifest)
                     record_retry_event(
                         run_dir,
                         retry_type=retry_key,
@@ -628,7 +629,7 @@ def main() -> int:
                         error=exc.message,
                     )
                 if isinstance(exc, InfraError):
-                    current = read_json(run_dir / "manifest.json")
+                    current = read_json(layout.manifest(run_dir))
                     if current.get("state") != "USER_DECISION_REQUIRED":
                         mark_terminal(run_dir, "INFRA_ERROR", exc.message)
                 write_timeline(run_dir)
