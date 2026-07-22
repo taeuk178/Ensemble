@@ -420,7 +420,7 @@ def command_issue_audit(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Claude와 GPT로 구현 명세를 만들고 검토합니다.")
+    parser = argparse.ArgumentParser(description="작성자 모델과 GPT로 구현 명세를 만들고 검토합니다.")
     subparsers = parser.add_subparsers(title="명령", dest="command", required=True)
 
     init = subparsers.add_parser("init", help="새 실행 시작")

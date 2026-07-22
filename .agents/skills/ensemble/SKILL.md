@@ -1,14 +1,12 @@
 ---
 name: ensemble
-description: 사용자 요청을 Claude와 GPT가 각각 분석하고, 검토와 수정을 거쳐 구현 가능한 명세로 만든다. 제품·기능·문서 요구를 구체화하고 완료 기준과 미결정 사항을 정리할 때 사용한다.
-disable-model-invocation: true
-argument-hint: "[--from <path> | 무엇을 만들지에 대한 설명]"
-allowed-tools: Bash(python3 .claude/skills/ensemble/scripts/review.py *)
+description: 사용자 요청을 Codex와 GPT가 각각 분석하고, 검토와 수정을 거쳐 구현 가능한 명세로 만든다. 제품·기능·문서 요구를 구체화하고 완료 기준과 미결정 사항을 정리할 때 사용한다.
+allowed-tools: Bash(python3 .agents/skills/ensemble/scripts/review.py *)
 ---
 
 # Ensemble
 
-Claude가 명세를 작성하고 GPT가 독립적으로 검토한다. `review.py`로 파일, 검토 순서, 이슈, 종료 상태를 관리한다.
+Codex가 명세를 작성하고 GPT가 독립적으로 검토한다. `review.py`로 파일, 검토 순서, 이슈, 종료 상태를 관리한다.
 
 ## 실행 규칙
 
@@ -23,8 +21,8 @@ Claude가 명세를 작성하고 GPT가 독립적으로 검토한다. `review.py
 1. 요청으로 새 실행을 만든다.
 
    ```bash
-   python3 .claude/skills/ensemble/scripts/review.py init --request-file <안전한-임시-파일>
-   python3 .claude/skills/ensemble/scripts/review.py init --from <명시된-request.md>
+   python3 .agents/skills/ensemble/scripts/review.py init --request-file <안전한-임시-파일>
+   python3 .agents/skills/ensemble/scripts/review.py init --from <명시된-request.md>
    ```
 
    반환된 `run_dir`를 이후 모든 명령의 `--run`에 사용한다.
@@ -32,27 +30,27 @@ Claude가 명세를 작성하고 GPT가 독립적으로 검토한다. `review.py
 2. 사용자 원문은 그대로 두고 `request.md`의 목표·범위·가정·확인 항목을 구체화한다. 필요한 완료 기준은 `rubric.md`에 `AC-NN` 형식으로 추가한다. 두 파일은 첫 초안을 저장하기 전까지만 바꾼다.
 
    ```bash
-   python3 .claude/skills/ensemble/scripts/review.py save --run <run> --kind request --source <구조화-request>
-   python3 .claude/skills/ensemble/scripts/review.py save --run <run> --kind rubric --source <rubric>
+   python3 .agents/skills/ensemble/scripts/review.py save --run <run> --kind request --source <구조화-request>
+   python3 .agents/skills/ensemble/scripts/review.py save --run <run> --kind rubric --source <rubric>
    ```
 
-3. 해당 실행의 `request.md`와 `rubric.md`만 읽고 Claude의 제안을 작성해 저장한다. 이어 GPT의 독립 제안을 받는다.
+3. 해당 실행의 `request.md`와 `rubric.md`만 읽고 Codex의 제안을 작성해 저장한다. 이어 GPT의 독립 제안을 받는다. 내부 호환성을 위해 제안 종류는 `claude-proposal`을 사용한다.
 
    ```bash
-   python3 .claude/skills/ensemble/scripts/review.py save --run <run> --kind claude-proposal --source <file>
-   python3 .claude/skills/ensemble/scripts/review.py propose --run <run>
+   python3 .agents/skills/ensemble/scripts/review.py save --run <run> --kind claude-proposal --source <file>
+   python3 .agents/skills/ensemble/scripts/review.py propose --run <run>
    ```
 
 4. 두 제안을 합쳐 첫 초안을 저장한다.
 
    ```bash
-   python3 .claude/skills/ensemble/scripts/review.py save --run <run> --kind draft --round 0 --source <file>
+   python3 .agents/skills/ensemble/scripts/review.py save --run <run> --kind draft --round 0 --source <file>
    ```
 
 5. 초안을 검토한다.
 
    ```bash
-   python3 .claude/skills/ensemble/scripts/review.py review --run <run> --round 1
+   python3 .agents/skills/ensemble/scripts/review.py review --run <run> --round 1
    ```
 
    `--round`는 검토 번호다. 초안 번호와 같다고 가정하지 않는다. 특정 초안을 검토할 때만 `--draft-round <N>`을 쓴다.
@@ -74,33 +72,33 @@ Claude가 명세를 작성하고 GPT가 독립적으로 검토한다. `review.py
    ```
 
    ```bash
-   python3 .claude/skills/ensemble/scripts/review.py decision --run <run> --input <decision.json>
+   python3 .agents/skills/ensemble/scripts/review.py decision --run <run> --input <decision.json>
    ```
 
 7. 결과가 `APPROVED`이면 이전 검토 이력을 숨긴 최종 독립 검토(`FINAL_BLIND`)를 실행한다.
 
    ```bash
-   python3 .claude/skills/ensemble/scripts/review.py final-blind --run <run>
+   python3 .agents/skills/ensemble/scripts/review.py final-blind --run <run>
    ```
 
    새로 발견된 진행 차단 이슈가 있으면 등록하고 일반 검토로 돌아간다.
 
    ```bash
-   python3 .claude/skills/ensemble/scripts/review.py promote-final --run <run>
+   python3 .agents/skills/ensemble/scripts/review.py promote-final --run <run>
    ```
 
 8. 남은 차단 이슈가 없으면 최종 문서를 만든다.
 
    ```bash
-   python3 .claude/skills/ensemble/scripts/review.py finalize --run <run> --status auto
+   python3 .agents/skills/ensemble/scripts/review.py finalize --run <run> --status auto
    ```
 
 9. 매 명령의 `state`를 확인한다. `USER_DECISION_REQUIRED`, `ESCALATION_REQUIRED`, `PANEL_DISSENT`에서는 자동으로 진행하지 않는다. 사용자 선택을 받은 뒤 아래 명령으로 재개하거나 위험 수용을 기록한다.
 
    ```bash
-   python3 .claude/skills/ensemble/scripts/review.py resolve-user-decision \
+   python3 .agents/skills/ensemble/scripts/review.py resolve-user-decision \
      --run <run> --action REVISE --note-file <user-decision.txt>
-   python3 .claude/skills/ensemble/scripts/review.py accept-risk \
+   python3 .agents/skills/ensemble/scripts/review.py accept-risk \
      --run <run> --issue <id> --round <N> --note-file <note>
    ```
 

@@ -1,54 +1,51 @@
 # Ensemble
 
-Claude Code를 작성자·오케스트레이터로, Codex CLI의 GPT를 외부 리뷰어로 사용하는 문서 스펙 앙상블입니다. 실행 상태와 이슈 ID, 스키마 검증, 격리 bundle, 해시 및 종료 판정은 Python 래퍼가 결정적으로 관리합니다.
+사용자의 요청을 구현 가능한 명세로 다듬는 도구입니다. Claude가 초안을 만들고 GPT가 독립적으로 검토합니다. Python 스크립트는 파일 저장, 검토 순서, 이슈 추적, 종료 조건을 일관되게 관리합니다.
 
-설계 근거와 전체 규범은 [`handoff.md`](handoff.md)에 있습니다.
+자세한 설계와 판단 기준은 [`handoff.md`](handoff.md)에 있습니다.
 
 ## 구성
 
-- `.claude/skills/ensemble/SKILL.md`: Claude Code `/ensemble` 워크플로
-- `.claude/skills/ensemble/scripts/review.py`: 결정적 CLI 진입점
-- `.claude/skills/ensemble/scripts/ensemble_core/`: provider·registry·validation·bundle·state machine 등 분리 모듈
-- `.claude/skills/ensemble/references/`: 프롬프트와 JSON Schema
-- `.claude/skills/ensemble/fixtures/`: 재현성 측정용 고정 fixture
-- `ensemble/runs/`: 실행 산출물. Git에서 제외됨
+- `.claude/skills/ensemble/SKILL.md`: Claude Code에서 실행하는 `/ensemble` 절차
+- `.claude/skills/ensemble/scripts/review.py`: 전체 작업을 실행하는 CLI
+- `.claude/skills/ensemble/scripts/ensemble_core/`: 모델 호출, 검증, 이슈 관리, 상태 관리 모듈
+- `.claude/skills/ensemble/references/`: 모델 프롬프트와 JSON Schema
+- `.claude/skills/ensemble/fixtures/`: 결과 일관성을 확인하는 고정 예제
+- `ensemble/runs/`: 실행별 결과물. Git에는 포함하지 않음
 
-각 run에는 `timeline.md`가 자동 생성됩니다. Claude·GPT의 독립 제안, 리뷰가 참조한 초안 번호, 이슈별 판단과 사용자 결정, 최종 상태를 한 파일에서 순서대로 확인할 수 있습니다. 세부 원문은 `proposals/`, `reviews/`, `drafts/`, `issue-registry.json`, `decisions.md`에 그대로 남습니다.
+각 실행 폴더의 `timeline.md`에서 제안, 검토한 초안, 이슈별 판단, 사용자 결정, 최종 상태를 시간순으로 볼 수 있습니다. 원문은 `proposals/`, `reviews/`, `drafts/`, `issue-registry.json`, `decisions.md`에 보관됩니다.
 
-기존 run의 타임라인을 새로 만들거나 갱신하려면 다음을 실행합니다.
+기존 실행의 타임라인을 갱신하려면 다음 명령을 사용합니다.
 
 ```bash
 python3 .claude/skills/ensemble/scripts/review.py timeline --run <run_dir>
 ```
 
-Python 3.10 이상과 로그인된 Codex CLI가 필요합니다. `jsonschema`가 설치되어 있으면 표준 JSON Schema 검증을 추가로 사용하며, 설치되어 있지 않아도 내장된 엄격 검증기가 동일한 핵심 제약을 검사합니다.
+## 준비
+
+Python 3.10 이상과 로그인된 Codex CLI가 필요합니다. `jsonschema`는 선택 사항이며, 없어도 내장 검증기가 핵심 규칙을 검사합니다.
 
 ```bash
 python3 -m pip install -r .claude/skills/ensemble/requirements.txt
-```
-
-## 빠른 확인
-
-```bash
 python3 .claude/skills/ensemble/scripts/review.py preflight
 python3 -m unittest discover -s tests -v
 ```
 
-실제 모델까지 확인하려면 비용이 발생할 수 있는 live preflight를 명시적으로 실행합니다.
+실제 모델 연결까지 확인하려면 아래 명령을 사용합니다. 모델 사용 비용이 발생할 수 있습니다.
 
 ```bash
 python3 .claude/skills/ensemble/scripts/review.py preflight --live
 ```
 
-## 기본 흐름
+## 기본 사용법
 
-Claude Code에서 `/ensemble`을 실행하는 것이 기본 사용법입니다. 래퍼를 직접 사용할 때는 사용자 원문을 셸 인자로 보간하지 말고 파일로 전달하는 방식을 권장합니다.
+Claude Code에서 `/ensemble`을 실행하는 것이 가장 간단합니다. CLI를 직접 쓸 때는 사용자 요청을 명령문에 넣지 말고 파일로 전달합니다.
 
 ```bash
 python3 .claude/skills/ensemble/scripts/review.py init --request-file /tmp/request.txt
 ```
 
-명령이 반환한 `run_dir`를 사용해 진행합니다.
+반환된 `run_dir`를 이후 명령의 `--run`에 넣습니다.
 
 ```bash
 python3 .claude/skills/ensemble/scripts/review.py save --run <run_dir> --kind claude-proposal --source /tmp/claude-proposal.md
@@ -59,31 +56,57 @@ python3 .claude/skills/ensemble/scripts/review.py final-blind --run <run_dir>
 python3 .claude/skills/ensemble/scripts/review.py finalize --run <run_dir> --status auto
 ```
 
-리뷰 라운드와 초안 번호는 독립적입니다. `REJECT`로 문서를 수정하지 않았다면 초안을 복사하지 않고 다음 리뷰 번호를 실행하면 최신 초안을 다시 검토합니다. 특정 초안을 명시해야 할 때만 `review --draft-round <N>`을 사용합니다.
+검토 번호와 초안 번호는 별개입니다. 문서를 고치지 않았다면 새 초안을 만들지 않고 다음 검토 번호로 최신 초안을 다시 검토합니다. 특정 초안을 지정할 때만 `review --draft-round <N>`을 사용합니다.
 
-`USER_DECISION_REQUIRED` 또는 `ESCALATION_REQUIRED`가 되면 래퍼가 다음 초안·리뷰를 차단합니다. 사용자 판단을 받은 뒤 메모를 파일로 저장하고 명시적으로 재개합니다.
+`USER_DECISION_REQUIRED` 또는 `ESCALATION_REQUIRED`가 나오면 작업이 멈추고 사용자 선택을 기다립니다. 선택 내용을 파일로 저장한 뒤 작업을 재개합니다.
 
 ```bash
 python3 .claude/skills/ensemble/scripts/review.py resolve-user-decision \
   --run <run_dir> --action REVISE --note-file <사용자-결정.txt>
 ```
 
-`--action CONTINUE`도 지원합니다. 결정은 `decisions.md`, `manifest.json`, `timeline.md`에 기록됩니다.
+문서를 고치지 않고 검토를 이어가려면 `--action CONTINUE`를 사용합니다. 모든 결정은 `decisions.md`, `manifest.json`, `timeline.md`에 기록됩니다.
 
-모델을 호출하지 않고 저장된 JSON을 검증·반영하려면 `propose`, `review`, `final-blind`, `issue-audit`에 `--input <json>`을 지정할 수 있습니다. 이 경로는 테스트와 재현에 사용합니다.
+## 용어
 
-## 주요 안전 규칙
+| 표시 | 뜻 |
+|---|---|
+| 실행 (`run`) | 요청 하나를 시작해 최종 문서가 나올 때까지의 전체 작업 |
+| 입력 묶음 (`bundle`) | 모델에 전달해도 되는 파일만 모은 폴더 |
+| 완료 기준 (`rubric`) | 최종 명세가 충족해야 하는 확인 가능한 조건 |
+| 고정 예제 (`fixture`) | 같은 입력에 비슷한 판정이 나오는지 확인하는 테스트 자료 |
+| 최종 독립 검토 (`FINAL_BLIND`) | 이전 논의를 숨기고 최종 초안만 새로 검토하는 단계 |
+| 진행을 막는 이슈 (`blocker`) | 해결하거나 사용자가 위험을 받아들여야 다음 단계로 갈 수 있는 문제 |
+| 추가 판단 (`escalation`) | 작성자와 리뷰어가 합의하지 못했을 때 다른 평가를 받는 절차 |
+| 실행 기록 (`manifest.json`) | 상태, 모델, 재시도, 시작·종료 정보를 담은 파일 |
 
-- 일반 리뷰 bundle에는 `issue-registry.json`, `decisions.md`, 점수 이력이 들어가지 않습니다.
-- FINAL_BLIND는 request·rubric·draft만 받으며, 수용 위험은 평가 후 래퍼가 별도로 대조합니다.
-- 리뷰 파일과 draft 스냅샷은 덮어쓰지 않습니다.
-- 반복 상한은 승인 상태가 아니라 `ITERATION_LIMIT_REACHED`입니다.
-- Gemini가 없으면 교착을 임의 판정하지 않고 `USER_DECISION_REQUIRED`로 이관합니다.
-- `.env`, 토큰, 개인 키로 보이는 패턴이 요청에 있으면 초기화를 차단합니다.
-- run 시작 시 Ensemble 소스 해시, Git commit·dirty 상태, Codex/Gemini 실행 경로와 버전을 기록합니다. 실행 중 Ensemble 코드가 바뀌면 `RUN_TAINTED`로 중단합니다.
-- 각 provider 호출은 실제 실행 경로·버전·모델·라운드·재시도 원인을 `manifest.json`에 기록합니다.
+코드와 JSON에는 호환성을 위해 영문 상태값을 그대로 사용합니다.
 
-## 관측 및 패널
+자주 보는 상태는 다음과 같습니다.
+
+| 상태 | 의미 |
+|---|---|
+| `DRAFT_READY` | 초안을 만들거나 다시 검토할 수 있음 |
+| `NEEDS_REVISION` | 고쳐야 할 이슈가 있음 |
+| `APPROVED` | 일반 검토를 통과함. 최종 독립 검토는 아직 남아 있음 |
+| `USER_DECISION_REQUIRED` | 사용자 선택이 있어야 계속할 수 있음 |
+| `ESCALATION_REQUIRED` | 합의하지 못한 이슈에 추가 판단이 필요함 |
+| `CONVERGED` | 완료 기준상 남은 진행 차단 이슈가 없음 |
+| `ITERATION_LIMIT_REACHED` | 해결되지 않은 이슈가 있는 채 검토 한도에 도달함 |
+| `RUN_TAINTED` | 실행 중 코드가 바뀌어 새 실행이 필요함 |
+
+## 안전 규칙
+
+- 일반 검토의 입력 묶음에는 전체 이슈 기록, 작성자 결정, 이전 점수를 넣지 않습니다.
+- 최종 독립 검토에는 요청, 완료 기준, 최종 초안만 전달합니다.
+- 검토 결과와 초안 사본은 덮어쓰지 않습니다.
+- 최대 반복 횟수에 도달해도 승인으로 처리하지 않습니다.
+- 추가 평가자를 사용할 수 없으면 임의로 결론 내리지 않고 사용자에게 선택을 요청합니다.
+- 요청에 비밀정보로 보이는 내용이 있으면 실행을 막습니다.
+- 실행 중 Ensemble 코드가 바뀌면 해당 실행을 중단하고 새 실행을 요구합니다.
+- 호출한 모델, CLI 버전, 재시도 원인은 실행 기록에 남깁니다.
+
+## 진단 명령
 
 ```bash
 python3 .claude/skills/ensemble/scripts/review.py measure-noise --run <run_dir> --repetitions 3
@@ -91,4 +114,4 @@ python3 .claude/skills/ensemble/scripts/review.py issue-audit --run <run_dir> --
 python3 .claude/skills/ensemble/scripts/review.py panel --run <run_dir> --issue <R1-I1>
 ```
 
-수렴 지표는 보고·에스컬레이션 신호일 뿐 성공 종료를 만들지 않습니다.
+이 명령들은 판정이 얼마나 안정적인지 확인하고, 추가 판단이 필요한지 알려줍니다. 자동 승인을 만들지는 않습니다.
