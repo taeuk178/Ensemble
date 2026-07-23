@@ -28,7 +28,7 @@ from .config import (
 from .environment import ensemble_source_hash, git_commit, git_dirty
 from .errors import InfraError, InputError, StateError
 from .eval_process import filename_timestamp, load_or_compute
-from .eval_quality import judge_expectations
+from .eval_quality import judge_expectations, select_final_draft
 from .io_utils import atomic_write_json, read_json, sha256_text, utc_now
 from .state_machine import empty_usage_totals, initialize_run
 from . import layout
@@ -205,14 +205,18 @@ def validate_benchmark_block(payload: Any) -> dict[str, Any]:
 def observe_run(run_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
     """실행 산출물에서 채점에 쓸 관측값을 뽑는다.
 
-    상태 이력은 따로 저장되지 않으므로, 지나간 상태는 남아 있는 흔적
-    (검토 판정, 사용자 결정의 이전 상태, 패널 호출 수)으로만 복원한다.
-    `forbidden_states` 판정은 이 범위 안에서만 유효하다.
+    신버전 실행은 manifest.state_history를 권위 이력으로 쓴다. 구버전 실행은
+    남아 있는 검토·결정·패널 흔적으로 보완 복원한다.
     """
     state = str(manifest.get("state") or "")
     decisions = [item for item in (manifest.get("user_decisions") or []) if isinstance(item, dict)]
     from_states = {str(item.get("from_state")) for item in decisions}
     states_seen = {state} | from_states
+    states_seen |= {
+        str(item.get("to"))
+        for item in (manifest.get("state_history") or [])
+        if isinstance(item, dict)
+    }
     states_seen |= {
         str(item.get("verdict"))
         for item in (manifest.get("review_history") or [])
@@ -264,12 +268,8 @@ def evaluate_init_block(case: dict[str, Any]) -> dict[str, Any]:
 
 # --- 채점 ------------------------------------------------------------
 
-def grade_case(
-    case: dict[str, Any],
-    observation: dict[str, Any],
-    quality_findings: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """케이스 유형별 판정. 공통 PASS 규칙 하나로 묶지 않는다."""
+def grade_state(case: dict[str, Any], observation: dict[str, Any]) -> dict[str, Any]:
+    """모델 심판을 부르기 전에 결정적으로 판정할 수 있는 실행 상태 축."""
     expected = case["expected"]
     reasons: list[str] = []
     if not expected["reviewed_by_user"]:
@@ -278,7 +278,6 @@ def grade_case(
         return {"verdict": "SKIP", "reasons": ["실행 도중 Ensemble 코드가 바뀌었습니다(RUN_TAINTED)."]}
     if observation.get("terminal_state") in INFRA_SKIP_STATES:
         return {"verdict": "SKIP", "reasons": ["외부 인프라 장애로 실행이 완료되지 못했습니다."]}
-
     if expected["case_type"] == "init_block":
         if observation.get("init_blocked") and observation.get("run_dir") is None:
             return {"verdict": "PASS", "reasons": []}
@@ -302,6 +301,20 @@ def grade_case(
             f"추가 판단 기대와 관측이 다릅니다: 기대 {expected['expect_escalation']}, "
             f"관측 {bool(observation.get('escalation_reached'))}"
         )
+    return {"verdict": "FAIL" if reasons else "PASS", "reasons": reasons}
+
+
+def grade_case(
+    case: dict[str, Any],
+    observation: dict[str, Any],
+    quality_findings: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """케이스 유형별 판정. 공통 PASS 규칙 하나로 묶지 않는다."""
+    expected = case["expected"]
+    state_grade = grade_state(case, observation)
+    if state_grade["verdict"] != "PASS":
+        return state_grade
+    reasons: list[str] = []
 
     if expected["case_type"] == "quality":
         if quality_findings is None:
@@ -339,7 +352,7 @@ def collect_benchmark_runs(benchmark_run_id: str) -> list[tuple[Path, dict[str, 
     return collected
 
 
-def _sum_usage(target: dict[str, dict[str, int]], usage: Any) -> None:
+def _sum_usage(target: dict[str, dict[str, Any]], usage: Any) -> None:
     if not isinstance(usage, dict):
         return
     for provider, totals in usage.items():
@@ -349,6 +362,13 @@ def _sum_usage(target: dict[str, dict[str, int]], usage: Any) -> None:
         for key, value in totals.items():
             if isinstance(value, int) and not isinstance(value, bool):
                 bucket[key] = bucket.get(key, 0) + value
+        # 오차의 방향은 합산해도 사라지면 안 된다. 케이스 하나라도 시간 창으로
+        # 귀속했으면 그 제공자의 합계는 상한값이다.
+        if totals.get("upper_bound"):
+            bucket["upper_bound"] = True
+            bucket["attribution"] = totals.get("attribution")
+        if totals.get("unreported_fields"):
+            bucket["unreported_fields"] = list(totals["unreported_fields"])
 
 
 def _process_summary(run_dir: Path) -> dict[str, Any]:
@@ -356,6 +376,10 @@ def _process_summary(run_dir: Path) -> dict[str, Any]:
     return {
         "review_rounds": metrics.get("convergence", {}).get("review_rounds"),
         "leakage_rate": metrics.get("leakage", {}).get("leakage_rate_lower_bound"),
+        "leakage_rate_observed": metrics.get("leakage", {}).get("leakage_rate_observed"),
+        "unpromoted_final_findings": metrics.get("leakage", {}).get(
+            "unique_unpromoted_final_blind_blockers"
+        ),
         "retries": metrics.get("friction", {}).get("retries", {}),
         "wall_clock_seconds": metrics.get("resources", {}).get("wall_clock_seconds"),
     }
@@ -378,24 +402,66 @@ def collect(
     judge_effort: str = DEFAULT_PANEL_EFFORT,
     timeout: int,
     skip_expectation_judge: bool = False,
+    force_judge: bool = False,
 ) -> dict[str, Any]:
     cases = iter_cases(suite, case_id=case_id)
     if not cases:
         raise InputError(f"{suite} 세트에 케이스가 없습니다.")
     runs = collect_benchmark_runs(benchmark_run_id)
+    current_cases = {case["case_id"]: case for case in cases}
+    comparable_runs = [
+        (run_dir, manifest)
+        for run_dir, manifest in runs
+        if str((manifest.get("benchmark") or {}).get("case_id")) in current_cases
+        and (manifest.get("benchmark") or {}).get("case_revision_hash")
+        == current_cases[str((manifest.get("benchmark") or {}).get("case_id"))][
+            "case_revision_hash"
+        ]
+    ]
     by_case: dict[str, list[tuple[Path, dict[str, Any]]]] = {}
     for run_dir, manifest in runs:
         by_case.setdefault(str(manifest["benchmark"].get("case_id")), []).append((run_dir, manifest))
 
+    source_hashes = {
+        str((manifest.get("environment") or {}).get("ensemble_source_hash"))
+        for _, manifest in comparable_runs
+        if (manifest.get("environment") or {}).get("ensemble_source_hash")
+    }
+    commits = {
+        str((manifest.get("environment") or {}).get("git_commit"))
+        for _, manifest in comparable_runs
+        if (manifest.get("environment") or {}).get("git_commit")
+    }
+    codex_models = {
+        str(((manifest.get("models") or {}).get("codex") or {}).get("requested"))
+        for _, manifest in comparable_runs
+    }
+    agy_models = {
+        str(((manifest.get("models") or {}).get("agy") or {}).get("requested"))
+        for _, manifest in comparable_runs
+    }
+    author_models: set[str | None] = {
+        ((manifest.get("models") or {}).get("author") or {}).get("requested")
+        for _, manifest in comparable_runs
+    }
+    current_hash = ensemble_source_hash()
     warnings: list[str] = []
     tainted = False
+    if len(source_hashes) > 1:
+        tainted = True
+        warnings.append("수집한 실행들의 Ensemble 코드 해시가 서로 다릅니다.")
+    if source_hashes and current_hash not in source_hashes:
+        tainted = True
+        warnings.append("평가 시점의 코드가 실행 시점과 다릅니다.")
+    if git_dirty():
+        tainted = True
+        warnings.append("작업 사본에 커밋되지 않은 변경이 있습니다.")
+    if len(codex_models) > 1 or len(agy_models) > 1 or len(author_models) > 1:
+        tainted = True
+        warnings.append("수집한 실행들의 모델 구성이 서로 다릅니다.")
+    collection_tainted = tainted
     entries: list[dict[str, Any]] = []
     usage_totals: dict[str, dict[str, int]] = {}
-    source_hashes: set[str] = set()
-    commits: set[str] = set()
-    codex_models: set[str] = set()
-    agy_models: set[str] = set()
-    author_models: set[str | None] = set()
 
     for case in cases:
         case_type = case["expected"]["case_type"]
@@ -453,40 +519,72 @@ def collect(
                     f"({manifest.get('run_id')})"
                 )
                 continue
-            environment = manifest.get("environment") or {}
-            if environment.get("ensemble_source_hash"):
-                source_hashes.add(str(environment["ensemble_source_hash"]))
-            if environment.get("git_commit"):
-                commits.add(str(environment["git_commit"]))
-            models = manifest.get("models") or {}
-            codex_models.add(str((models.get("codex") or {}).get("requested")))
-            agy_models.add(str((models.get("agy") or {}).get("requested")))
-            author_models.add((models.get("author") or {}).get("requested"))
-
             observation = observe_run(run_dir, manifest)
             if observation["tainted"]:
                 tainted = True
             quality_findings = None
             judge_usage = None
-            if case_type == "quality" and not skip_expectation_judge and not observation["tainted"]:
-                final_path = layout.final(run_dir)
-                if not final_path.exists():
-                    warnings.append(f"{case['case_id']}: final.md가 없어 정답지 채점을 건너뜁니다.")
+            judge_status = "NOT_APPLICABLE"
+            judge_failure_record = None
+            state_grade = grade_state(case, observation)
+            if case_type == "quality":
+                if skip_expectation_judge:
+                    judge_status = "NOT_RUN_REQUESTED"
+                elif not force_judge and state_grade["verdict"] != "PASS":
+                    judge_status = "NOT_RUN_STATE_FAILED"
+                elif not force_judge and collection_tainted:
+                    judge_status = "NOT_RUN_TAINTED"
                 else:
-                    try:
-                        quality_findings, judge_result = judge_expectations(
-                            run_dir,
-                            document_path=final_path,
-                            expectations=case["expected"]["quality_expectations"],
-                            model=judge_model,
-                            effort=judge_effort,
-                            timeout=timeout,
+                    final_path = select_final_draft(run_dir, manifest)
+                    if final_path is None:
+                        judge_status = "NOT_RUN_NO_DRAFT"
+                        warnings.append(
+                            f"{case['case_id']}: 비교할 최종 초안이 없어 정답지 채점을 건너뜁니다."
                         )
-                        judge_usage = {"agy": empty_usage_totals()}
-                        judge_usage["agy"]["calls_unreported"] = 1
-                        judge_usage["agy"]["attempts_unreported"] = judge_result.attempts
-                    except InfraError as exc:
-                        warnings.append(f"{case['case_id']}: 정답지 채점 심판 호출이 실패했습니다: {exc.message}")
+                    else:
+                        try:
+                            quality_findings, judge_result = judge_expectations(
+                                run_dir,
+                                document_path=final_path,
+                                expectations=case["expected"]["quality_expectations"],
+                                model=judge_model,
+                                effort=judge_effort,
+                                timeout=timeout,
+                            )
+                            judge_usage = {"agy": empty_usage_totals()}
+                            judge_usage["agy"]["calls_unreported"] = 1
+                            judge_usage["agy"]["attempts_unreported"] = judge_result.attempts
+                            judge_status = "JUDGED"
+                        except InfraError as exc:
+                            details = exc.details if isinstance(exc.details, dict) else {}
+                            failure_index = len(
+                                list(layout.judge_raw_dir(run_dir).glob("*.json"))
+                            ) + 1
+                            failure_path = layout.judge_failure(run_dir, failure_index)
+                            while failure_path.exists():
+                                failure_index += 1
+                                failure_path = layout.judge_failure(run_dir, failure_index)
+                            atomic_write_json(
+                                failure_path,
+                                {
+                                    "recorded_at": utc_now(),
+                                    "provider": details.get("provider", "agy"),
+                                    "error": exc.message,
+                                    "details": details,
+                                },
+                                overwrite=False,
+                            )
+                            judge_failure_record = failure_path.relative_to(run_dir).as_posix()
+                            judge_usage = {"agy": empty_usage_totals()}
+                            judge_usage["agy"]["calls_unreported"] = 1
+                            judge_usage["agy"]["attempts_unreported"] = int(
+                                details.get("attempts") or 1
+                            )
+                            judge_status = "INFRA_ERROR"
+                            warnings.append(
+                                f"{case['case_id']}: 정답지 채점 심판 호출이 실패했습니다: "
+                                f"{exc.message} ({judge_failure_record})"
+                            )
 
             grade = grade_case(case, observation, quality_findings)
             quality_judgment = _quality_summary(run_dir)
@@ -506,6 +604,8 @@ def collect(
                     "observed": observation,
                     "process_metrics": _process_summary(run_dir),
                     "quality_judgment": {
+                        "judge_status": judge_status,
+                        "failure_record": judge_failure_record,
                         "overall": (quality_judgment or {}).get("composite", {}).get("overall"),
                         "must_cover_missing": (quality_findings or {}).get("must_cover_missing", []),
                         "must_not_assert_violations": (quality_findings or {}).get(
@@ -515,19 +615,6 @@ def collect(
                     "usage": {"run": run_usage, "judge": judge_usage},
                 }
             )
-
-    if len(source_hashes) > 1:
-        tainted = True
-        warnings.append("수집한 실행들의 Ensemble 코드 해시가 서로 다릅니다.")
-    current_hash = ensemble_source_hash()
-    if source_hashes and current_hash not in source_hashes:
-        warnings.append("평가 시점의 코드가 실행 시점과 다릅니다.")
-    if git_dirty():
-        tainted = True
-        warnings.append("작업 사본에 커밋되지 않은 변경이 있습니다.")
-    if len(codex_models) > 1 or len(agy_models) > 1:
-        tainted = True
-        warnings.append("수집한 실행들의 모델 구성이 서로 다릅니다.")
 
     verdicts = Counter(entry["verdict"] for entry in entries)
     draft_better = sum(
@@ -582,26 +669,25 @@ def write_scorecard(scorecard: dict[str, Any]) -> Path:
     return path
 
 
-def plan(suite: str, *, case_id: str | None = None) -> dict[str, Any]:
+def plan(
+    suite: str,
+    *,
+    case_id: str | None = None,
+    repeat: int = 1,
+) -> dict[str, Any]:
     """세트를 완주하기 전에 필요한 정보를 내놓는다.
 
     `init_block` 케이스는 여기서 바로 채점한다 — 모델 호출이 없어 결정적이고
     비용이 0이다. 나머지는 `/ensemble-eval` 스킬이 케이스별로 실행해야 한다.
     """
+    if repeat < 1:
+        raise InputError("--repeat은 1 이상의 정수여야 합니다.")
     cases = iter_cases(suite, case_id=case_id)
     benchmark_run_id = make_benchmark_run_id()
     computed_suite_hash = suite_hash(cases)
     pending: list[dict[str, Any]] = []
     immediate: list[dict[str, Any]] = []
     for case in cases:
-        block = {
-            "benchmark_run_id": benchmark_run_id,
-            "case_id": case["case_id"],
-            "case_revision_hash": case["case_revision_hash"],
-            "suite": suite,
-            "suite_hash": computed_suite_hash,
-            "repeat_index": 1,
-        }
         if case["expected"]["case_type"] == "init_block":
             observation = evaluate_init_block(case)
             immediate.append(
@@ -612,19 +698,28 @@ def plan(suite: str, *, case_id: str | None = None) -> dict[str, Any]:
                 }
             )
             continue
-        pending.append(
-            {
-                "case_id": case["case_id"],
-                "case_type": case["expected"]["case_type"],
-                "reviewed_by_user": case["expected"]["reviewed_by_user"],
-                "request_file": str(layout.case_request(case["case_id"])),
-                "benchmark": block,
-            }
-        )
+        for repeat_index in range(1, repeat + 1):
+            pending.append(
+                {
+                    "case_id": case["case_id"],
+                    "case_type": case["expected"]["case_type"],
+                    "reviewed_by_user": case["expected"]["reviewed_by_user"],
+                    "request_file": str(layout.case_request(case["case_id"])),
+                    "benchmark": {
+                        "benchmark_run_id": benchmark_run_id,
+                        "case_id": case["case_id"],
+                        "case_revision_hash": case["case_revision_hash"],
+                        "suite": suite,
+                        "suite_hash": computed_suite_hash,
+                        "repeat_index": repeat_index,
+                    },
+                }
+            )
     return {
         "suite": suite,
         "suite_hash": computed_suite_hash,
         "benchmark_run_id": benchmark_run_id,
+        "repeat": repeat,
         "immediate": immediate,
         "pending_runs": pending,
         "next_command": (

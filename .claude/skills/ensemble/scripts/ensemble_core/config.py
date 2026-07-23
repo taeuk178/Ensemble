@@ -12,6 +12,23 @@ EVAL_ROOT = PROJECT_ROOT / "eval"
 EVAL_CASES_ROOT = EVAL_ROOT / "cases"
 EVAL_RESULTS_ROOT = EVAL_ROOT / "results"
 
+
+def _claude_transcript_root() -> Path:
+    """Claude Code가 이 프로젝트의 세션 기록을 쌓는 폴더.
+
+    작성자(Claude)는 CLI가 아니라 스킬을 실행하는 주체라서 run_codex 같은
+    수집 지점이 없다. API 응답이 보고한 실측 토큰은 이 세션 기록에만 남는다.
+    폴더 이름은 프로젝트 절대 경로의 구분자를 `-`로 바꾼 것이다.
+    """
+    override = os.environ.get("ENSEMBLE_CLAUDE_TRANSCRIPT_DIR")
+    if override:
+        return Path(override)
+    config_home = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude"))
+    return config_home / "projects" / str(PROJECT_ROOT).replace("/", "-")
+
+
+CLAUDE_TRANSCRIPT_ROOT = _claude_transcript_root()
+
 DEFAULT_REVIEW_MODEL = os.environ.get("CODEX_REVIEW_MODEL", "gpt-5.6-sol")
 DEFAULT_PANEL_MODEL = os.environ.get("ANTIGRAVITY_PANEL_MODEL", "gemini-3.6-flash-high")
 # Codex runs with --ignore-user-config for reproducibility, so the user's
@@ -21,7 +38,10 @@ DEFAULT_REVIEW_EFFORT = os.environ.get("CODEX_REVIEW_EFFORT", "high")
 DEFAULT_PANEL_EFFORT = os.environ.get("ANTIGRAVITY_PANEL_EFFORT", "high")
 DEFAULT_TIMEOUT_SECONDS = 300
 DEFAULT_MAX_ROUNDS = 8
+DEFAULT_MAX_FINAL_BLIND_ATTEMPTS = 3
+DEFAULT_MAX_TOTAL_PROVIDER_CALLS = 16
 DEFAULT_MAX_PANEL_CALLS = 3
+AGY_INLINE_MAX_BYTES = 256 * 1024
 INFRA_RETRIES = 2
 SEMANTIC_RETRIES = 2
 
@@ -58,16 +78,24 @@ PAUSED_STATES = {"USER_DECISION_REQUIRED", "ESCALATION_REQUIRED"}
 REVIEW_BUNDLE_ALLOWLIST = {
     "request.md",
     "rubric.md",
+    "user-decisions.json",
     "draft.md",
     "reviewer-issue-index.json",
     "feedback-cards.md",
 }
-FINAL_BUNDLE_ALLOWLIST = {"request.md", "rubric.md", "draft.md"}
+FINAL_BUNDLE_ALLOWLIST = {"request.md", "rubric.md", "user-decisions.json", "draft.md"}
 PROPOSAL_BUNDLE_ALLOWLIST = {"request.md", "rubric.md"}
-PANEL_BUNDLE_ALLOWLIST = {"request.md", "rubric.md", "draft.md", "issue.json"}
+PANEL_BUNDLE_ALLOWLIST = {
+    "request.md",
+    "rubric.md",
+    "user-decisions.json",
+    "draft.md",
+    "issue.json",
+}
 AUDIT_BUNDLE_ALLOWLIST = {
     "request.md",
     "rubric.md",
+    "user-decisions.json",
     "draft.md",
     "previous-draft.md",
     "new-issues.json",
@@ -84,8 +112,20 @@ USAGE_FIELDS = (
 )
 
 # 심판 입력에는 어느 쪽이 최종본인지 알려 줄 파일을 넣지 않는다.
-JUDGE_BUNDLE_ALLOWLIST = {"request.md", "rubric.md", "document-1.md", "document-2.md"}
-JUDGE_EXPECTATIONS_BUNDLE_ALLOWLIST = {"request.md", "rubric.md", "document.md", "expectations.json"}
+JUDGE_BUNDLE_ALLOWLIST = {
+    "request.md",
+    "rubric.md",
+    "user-decisions.json",
+    "document-1.md",
+    "document-2.md",
+}
+JUDGE_EXPECTATIONS_BUNDLE_ALLOWLIST = {
+    "request.md",
+    "rubric.md",
+    "user-decisions.json",
+    "document.md",
+    "expectations.json",
+}
 
 # 비교 채점 축. 점수 척도 대신 축별 승자만 고른다.
 JUDGE_AXES = (

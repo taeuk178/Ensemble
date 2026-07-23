@@ -83,7 +83,7 @@ run이 만들어지지 않는 것이 정답이므로 종료 상태 검증은 적
 ### 3.1 runner가 단독 실행하는 부분
 
 ```bash
-python3 .claude/skills/ensemble/scripts/review.py eval-bench --suite smoke|full [--case <id>]
+python3 .claude/skills/ensemble/scripts/review.py eval-bench --suite smoke|full [--case <id>] [--repeat N]
 ```
 
 - `init_block` 케이스: `init`의 차단 여부만 확인하면 되므로 runner가 완전 자동으로 채점한다.
@@ -95,6 +95,8 @@ python3 .claude/skills/ensemble/scripts/review.py eval-bench --suite smoke|full 
 
 - 각 케이스의 `request.txt`로 `init --request-file`을 호출하고, 이후 단계는 SKILL.md의 작업 순서를 그대로 따른다.
 - `USER_DECISION_REQUIRED` 등 사용자 개입 지점에 도달하면 **그 상태 자체가 채점 대상이므로** 임의로 재개하지 않는다. 상태를 기록하고 다음 케이스로 넘어간다. 행동 케이스는 이 지점에서 채점이 끝난다.
+- 이 규칙은 문서 권고만이 아니다. `resolve-user-decision`은 benchmark 블록이 있는
+  실행의 재개를 거부한다. 지나간 상태는 `manifest.state_history`로 관측한다.
 - **실행 식별 계약**: 벤치마크 실행은 manifest에 `benchmark` 블록을 기록하고, runner는 label 같은 자유 문자열이 아니라 이 블록으로만 run을 수집한다. label 표식은 사람이 읽는 보조 수단이다.
 
   ```json
@@ -142,6 +144,11 @@ python3 .claude/skills/ensemble/scripts/review.py eval-compare --base <sha> --he
 ```
 
 - `--collect`는 `eval/results/<git-sha>/scorecard.json`을 만든다. 같은 sha에 이미 점수표가 있으면 `scorecard-<timestamp>.json`으로 보존 후 새로 쓴다. `eval/results/`는 Git에서 제외한다(상위 문서 §7 확정). 구현 시 `.gitignore`에 추가한다.
+- 품질 케이스는 먼저 상태 축을 결정적으로 채점한다. 이미 FAIL/SKIP/UNREVIEWED가
+  정해졌거나 전체 수집분이 tainted이면 기대사항 심판을 호출하지 않는다.
+  `--force-judge`는 진단 목적으로만 이 보호를 무시한다.
+- 심판 실패는 `eval/judge-raw/failure-N.json`과
+  `quality_judgment.judge_status`에 기록하고 실행 상태·provider_calls와 섞지 않는다.
 - 벤치마크 도중 코드가 바뀌면(작업 사본 dirty, run들의 `ensemble_source_hash` 불일치, `RUN_TAINTED` 관측 포함) 점수표에 `tainted: true`를 기록한다. `RUN_TAINTED`와 같은 철학이며, tainted 점수표는 `eval-compare`가 기본적으로 거부한다.
 - `eval-compare`의 비교 가능 조건: (1) 두 점수표 모두 `tainted: false`, (2) `suite_hash`가 같음(같은 케이스 세트 버전), (3) `model_config`가 같음. 모델 구성이 다르면 기본 거부하고, 명시적 플래그로만 경고와 함께 비교를 허용한다 — 점수 차이가 코드 때문인지 모델 때문인지 구분할 수 없기 때문이다.
 - 출력은 케이스별 판정, 1층 핵심 지표(라운드 수, 누출률, 재시도), 사용량 합계의 병렬 표다. 케이스당 1회 실행끼리의 판정 차이는 "회귀"가 아니라 **"회귀 신호"**로 표기한다. 확률적 흔들림과 회귀를 구분하려면 반복 실행(`--repeat`)이 필요하다.
@@ -185,6 +192,8 @@ python3 .claude/skills/ensemble/scripts/review.py eval-compare --base <sha> --he
         "wall_clock_seconds": null
       },
       "quality_judgment": {
+        "judge_status": "JUDGED | NOT_RUN_STATE_FAILED | NOT_RUN_TAINTED | INFRA_ERROR | …",
+        "failure_record": "eval/judge-raw/failure-N.json | null",
         "overall": "FINAL_BETTER | … | null",
         "must_cover_missing": [],
         "must_not_assert_violations": []
@@ -210,7 +219,9 @@ python3 .claude/skills/ensemble/scripts/review.py eval-compare --base <sha> --he
 - 스모크 세트는 행동 케이스 중심으로 구성해 파이프라인 완주가 1건 이하가 되게 한다. 코드 변경마다 부담 없이 돌리는 용도다.
 - full 세트는 릴리스 전이나 파이프라인 로직 변경 시에만 돌린다. 1회 비용은 파이프라인 8~12회 실행과 같다.
 - 케이스별 `limits`(검토 라운드 상한)를 파이프라인 기본값보다 낮게 걸어 폭주를 막는 옵션을 검토한다. 단, 상한 도달(`ITERATION_LIMIT_REACHED`)은 그 자체로 관측 결과이므로 상한을 너무 낮추면 벤치마크가 왜곡된다. 초기값은 기본 상한을 그대로 쓴다.
-- 반복 실행은 `--repeat N`으로 지원하되 기본값은 1이다. 반복은 비용을 배수로 늘리므로, 모델 노이즈와 회귀를 구분해야 하는 시점(예: 단일 실행에서 회귀 신호가 나왔을 때)에만 늘린다.
+- 반복 실행은 `--repeat N`으로 지원하며 기본값은 1이다. runner가 각 non-init
+  케이스의 `repeat_index`를 1..N으로 확장한다. 반복은 비용을 배수로 늘리므로,
+  모델 노이즈와 회귀를 구분해야 하는 시점에만 늘린다.
 
 ## 7. 테스트 계획
 

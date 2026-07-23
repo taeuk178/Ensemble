@@ -62,8 +62,21 @@ def _convergence_metrics(
     )
     if not rounds:
         warnings.append("convergence.json에 라운드 기록이 없어 라운드별 지표가 비어 있습니다.")
+    counters = manifest.get("counters") or {}
+    iterative_reviews = (
+        _int(counters.get("iterative_reviews"))
+        if isinstance(counters.get("iterative_reviews"), int)
+        else len(history)
+    )
+    promotions = _int(counters.get("promotions"))
+    session_policy = manifest.get("review_session_policy") or {}
     return {
-        "review_rounds": len(history),
+        # 승격은 시퀀스 번호를 쓰지만 일반 검토 예산과 검토 횟수에는 넣지 않는다.
+        "review_rounds": iterative_reviews,
+        "iterative_reviews": iterative_reviews,
+        "sequence_rounds": len(history),
+        "promotions": promotions,
+        "review_session_resets": _int(session_policy.get("reset_count")),
         "draft_rounds": max(draft_rounds) + 1 if draft_rounds else None,
         "final_state": state,
         "terminated_cleanly": state in CLEAN_TERMINAL_STATES,
@@ -88,8 +101,18 @@ def _leakage_metrics(
     """
     by_name = dict(reconciliations)
     attempts: list[dict[str, Any]] = []
+    observed_final_keys: set[tuple[str, str]] = set()
     for name, blind in final_blinds:
         record = by_name.get(name)
+        attempt_keys: set[tuple[str, str]] = set()
+        if record:
+            for finding_record in record.get("unaccepted_blocking_findings") or []:
+                finding = finding_record.get("finding") or {}
+                criterion = str(finding.get("criterion_id") or "")
+                consequence = str(finding_record.get("consequence_fingerprint") or "")
+                if criterion and consequence:
+                    attempt_keys.add((criterion, consequence))
+            observed_final_keys.update(attempt_keys)
         attempts.append(
             {
                 "attempt_file": name,
@@ -101,6 +124,7 @@ def _leakage_metrics(
                     len(record.get("unaccepted_blocking_findings") or []) if record else None
                 ),
                 "passed": record.get("passed") if record else None,
+                "unique_unaccepted_finding_keys": len(attempt_keys) if record else None,
             }
         )
         if record is None:
@@ -121,6 +145,9 @@ def _leakage_metrics(
             unknown_origin += 1
 
     denominator = iterative_origin + promoted_origin
+    observed_final_unique = len(observed_final_keys)
+    observed_denominator = iterative_origin + observed_final_unique
+    unique_unpromoted = max(observed_final_unique - promoted_origin, 0)
     unpromoted = (
         len(reconciliations[-1][1].get("unaccepted_blocking_findings") or [])
         if reconciliations
@@ -143,7 +170,12 @@ def _leakage_metrics(
         "unique_promoted_final_blind_blockers": promoted_origin,
         "unknown_origin_blockers": unknown_origin,
         "unpromoted_unaccepted_last_attempt": unpromoted,
+        "unique_observed_final_blind_blockers": observed_final_unique,
+        "unique_unpromoted_final_blind_blockers": unique_unpromoted,
         "leakage_rate_lower_bound": (promoted_origin / denominator) if denominator else None,
+        "leakage_rate_observed": (
+            observed_final_unique / observed_denominator if observed_denominator else None
+        ),
     }
 
 
@@ -235,8 +267,19 @@ def _resource_metrics(manifest: dict[str, Any], warnings: list[str]) -> dict[str
     )
     if unreported_calls or unreported_attempts:
         warnings.append(
-            "사용량을 보고하지 않은 호출이 있어 토큰 합계는 하한값입니다: "
+            "사용량을 보고하지 않은 호출이 있어 해당 제공자의 토큰 합계는 하한값입니다: "
             f"논리 호출 {unreported_calls}건, 시도 {unreported_attempts}건"
+        )
+    # 제공자마다 오차의 방향이 다르다. CLI 제공자는 미보고 호출 때문에
+    # 하한값이고, 작성자는 시간 창에 무관한 작업이 섞일 수 있어 상한값이다.
+    # 두 값을 한 숫자로 합치면 방향이 사라지므로 제공자별로 표시한다.
+    upper_bound_providers = sorted(
+        name for name, totals in usage.items() if isinstance(totals, dict) and totals.get("upper_bound")
+    )
+    if upper_bound_providers:
+        warnings.append(
+            "시간 창으로 귀속한 제공자가 있어 그 합계는 상한값입니다: "
+            f"{', '.join(upper_bound_providers)}"
         )
     return {
         "wall_clock_seconds": wall_clock,
@@ -244,6 +287,7 @@ def _resource_metrics(manifest: dict[str, Any], warnings: list[str]) -> dict[str
         "usage_incomplete": bool(unreported_calls or unreported_attempts),
         "usage_unreported_calls": unreported_calls,
         "usage_unreported_attempts": unreported_attempts,
+        "usage_upper_bound_providers": upper_bound_providers,
     }
 
 
@@ -289,8 +333,17 @@ def evaluate_run(run_dir: Path, *, write: bool = True) -> dict[str, Any]:
     convergence_path = layout.convergence(run_dir)
     convergence = read_json(convergence_path, default={"rounds": [], "events": []})
     registry = read_json(layout.registry(run_dir), default={})
+    metric_manifest = {
+        **manifest,
+        "counters": {**(manifest.get("counters") or {})},
+    }
+    counters = metric_manifest["counters"]
+    # counters 도입 이전의 layout v2 실행도 파일 종류로 정확히 복원한다.
+    counters.setdefault("iterative_reviews", len(layout.iter_reviews(run_dir)))
+    counters.setdefault("promotions", len(layout.iter_promoted(run_dir)))
+    counters.setdefault("final_blind_attempts", len(layout.iter_blinds(run_dir)))
     metrics = compute_process_metrics(
-        manifest,
+        metric_manifest,
         convergence,
         registry,
         _load_pairs(layout.iter_blinds(run_dir)),
@@ -339,10 +392,12 @@ def _write_metrics(run_dir: Path, result: dict[str, Any]) -> None:
 
 
 def load_or_compute(run_dir: Path) -> dict[str, Any]:
-    """이미 계산된 지표가 있으면 재사용한다. 없으면 계산해 저장한다."""
+    """같은 지표 구현으로 계산된 결과만 재사용한다."""
     path = layout.process_metrics(run_dir)
     if path.exists():
-        return read_json(path)
+        existing = read_json(path)
+        if existing.get("evaluator_source_hash") == ensemble_source_hash():
+            return existing
     return evaluate_run(run_dir)
 
 
@@ -355,6 +410,8 @@ COMPARISON_METRICS = (
     ("leakage", "final_blind_attempts"),
     ("leakage", "final_blind_first_pass"),
     ("leakage", "leakage_rate_lower_bound"),
+    ("leakage", "leakage_rate_observed"),
+    ("leakage", "unique_unpromoted_final_blind_blockers"),
     ("issues", "total_issues"),
     ("issues", "acceptance_rate"),
     ("issues", "resolved_without_relevant_edit"),

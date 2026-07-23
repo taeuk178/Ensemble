@@ -4,11 +4,17 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from .claude_usage import record_claude_usage
 from .config import OPEN_STATUSES
-from .errors import InputError, StateError
+from .errors import EnsembleError, InputError, StateError
 from .io_utils import atomic_write_text, read_json
 from .registry import load_registry
-from .state_machine import mark_terminal
+from .state_machine import (
+    add_manifest_warning,
+    final_blind_attempt_count,
+    iterative_review_count,
+    mark_terminal,
+)
 from . import layout
 
 
@@ -32,54 +38,24 @@ def infer_terminal_status(run_dir: Path) -> tuple[str, str]:
         return "CONVERGED", "최종 독립 검토 후 남은 진행 차단 이슈가 없습니다."
     if manifest.get("phase") == "1A":
         return "PROTOTYPE_INCOMPLETE", "최종 독립 검토에서 새 진행 차단 이슈가 발견되었습니다."
-    if int(manifest.get("last_review_round", 0)) >= int(manifest["limits"]["review_rounds"]):
-        return "ITERATION_LIMIT_REACHED", "해결하지 못한 진행 차단 이슈가 있는 상태로 검토 횟수 한도에 도달했습니다."
+    limits = manifest.get("limits") or {}
+    if iterative_review_count(run_dir, manifest) >= int(
+        limits.get("iterative_reviews", limits.get("review_rounds", 0))
+    ):
+        return (
+            "ITERATION_LIMIT_REACHED",
+            "해결하지 못한 진행 차단 이슈가 있는 상태로 일반 검토 횟수 한도에 도달했습니다.",
+        )
+    if final_blind_attempt_count(run_dir, manifest) >= int(
+        limits.get("final_blind_attempts", 3)
+    ):
+        return (
+            "ITERATION_LIMIT_REACHED",
+            "최종 독립 검토가 통과하지 못한 상태로 독립 검토 시도 한도에 도달했습니다.",
+        )
     raise StateError(
         "아직 종료할 수 없습니다. 최종 독립 검토의 새 이슈를 등록하거나 남은 진행 차단 이슈를 해결해 주세요."
     )
-
-
-def _minority_appendix(registry: dict[str, Any]) -> str:
-    lines = ["## 미해결 이견", ""]
-    found = False
-    for issue_id, issue in sorted(registry.items()):
-        if issue.get("status") not in OPEN_STATUSES:
-            continue
-        found = True
-        latest = issue.get("latest_issue") or {}
-        author = (issue.get("author_disposition_history") or [{}])[-1]
-        lines.extend(
-            [
-                f"### {issue_id} {latest.get('problem', '')}",
-                f"- GPT: 중요도 {latest.get('severity')} — {latest.get('implementation_consequence')}",
-                f"- Claude(작성자): {author.get('value', '미기록')} — {author.get('claim', '판단 없음')}",
-                f"- 상태: {issue.get('status')}",
-                "",
-            ]
-        )
-    return "\n".join(lines).rstrip() if found else ""
-
-
-def _accepted_risk_appendix(registry: dict[str, Any]) -> str:
-    lines = ["## 사용자가 수용한 위험", ""]
-    found = False
-    for issue_id, issue in sorted(registry.items()):
-        if issue.get("status") != "ACCEPTED_RISK":
-            continue
-        found = True
-        snapshot = issue.get("accepted_issue_snapshot") or {}
-        lines.extend(
-            [
-                f"### {issue_id} {snapshot.get('problem', '')} (중요도 {snapshot.get('severity')})",
-                f"- 수용한 검토 번호: {issue.get('accepted_at_round')}",
-                f"- 예상 영향: {snapshot.get('implementation_consequence')}",
-                f"- 판단 근거: {snapshot.get('basis')}",
-                f"- 사용자 메모: {issue.get('acceptance_note')}",
-                f"- 참조 섹션: {', '.join(snapshot.get('evidence_refs', []))}",
-                "",
-            ]
-        )
-    return "\n".join(lines).rstrip() if found else ""
 
 
 def finalize(run_dir: Path, *, status: str) -> dict[str, Any]:
@@ -99,15 +75,19 @@ def finalize(run_dir: Path, *, status: str) -> dict[str, Any]:
         if not candidates:
             raise StateError("최종 문서로 만들 초안이 없습니다.")
         draft_path = candidates[-1]
-    registry = load_registry(run_dir)
     body = draft_path.read_text(encoding="utf-8").rstrip()
-    appendices = [part for part in (_minority_appendix(registry), _accepted_risk_appendix(registry)) if part]
-    header = f"<!-- ensemble-status: {status} -->\n"
-    final_text = header + body
-    if appendices:
-        final_text += "\n\n---\n\n" + "\n\n".join(appendices)
-    atomic_write_text(layout.final(run_dir), final_text)
+    # final.md는 모델 검토 이력이나 상태 메타데이터를 섞지 않은 산출물이어야
+    # 한다. 상태·이견·수용 위험은 manifest/registry/timeline에서만 보고한다.
+    atomic_write_text(layout.final(run_dir), body)
     marked = mark_terminal(run_dir, status, reason)
+    # 작성자 사용량은 종료 시각이 정해진 뒤에야 창이 확정된다. 세션 기록이
+    # 없거나 읽을 수 없어도 종료 자체를 막지 않는다.
+    try:
+        record_claude_usage(run_dir)
+        marked = read_json(layout.manifest(run_dir))
+    except (EnsembleError, OSError) as exc:
+        add_manifest_warning(run_dir, f"작성자 토큰 사용량을 수집하지 못했습니다: {exc}")
+        marked = read_json(layout.manifest(run_dir))
     convergence = read_json(layout.convergence(run_dir), default={"rounds": []})
     resolution_counts: Counter[str] = Counter()
     resolved_without = 0

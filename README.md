@@ -60,14 +60,14 @@ python3 .claude/skills/ensemble/scripts/review.py finalize --run <run_dir> --sta
 
 일반 검토는 같은 실행의 같은 요청 안에서 하나의 Codex 세션을 이어서 사용합니다. 1차 검토에서 세션을 만들고 다음 검토부터 이전 문답을 이어받습니다. 요청 원문이나 실행 ID가 다르면 세션 재사용을 거부합니다. 제안, 추가 판단, 이슈 점검, 최종 독립 검토는 기존처럼 새 세션에서 실행합니다.
 
-`USER_DECISION_REQUIRED` 또는 `ESCALATION_REQUIRED`가 나오면 작업이 멈추고 사용자 선택을 기다립니다. 선택 내용을 파일로 저장한 뒤 작업을 재개합니다.
+`USER_DECISION_REQUIRED` 또는 `ESCALATION_REQUIRED`가 나오면 작업이 멈추고 사용자 선택을 기다립니다. 선택과 새로 확정한 요구를 구조화 JSON으로 저장한 뒤 작업을 재개합니다.
 
 ```bash
 python3 .claude/skills/ensemble/scripts/review.py resolve-user-decision \
-  --run <run_dir> --action REVISE --note-file <사용자-결정.txt>
+  --run <run_dir> --decision-file <사용자-결정.json>
 ```
 
-문서를 고치지 않고 검토를 이어가려면 `--action CONTINUE`를 사용합니다. 모든 결정은 `decisions.md`, `manifest.json`, `timeline.md`에 기록됩니다.
+결정 파일은 `action`, `audit_note`, `authoritative_decisions`를 담습니다. 각 권위 결정은 `decision`과 기존 결정을 대체할 때 쓰는 `supersedes` ID 배열을 가집니다. 문서를 고치지 않고 검토를 이어가려면 `action`을 `CONTINUE`로 둡니다. 감사 기록은 `decisions.md`, `manifest.json`, `timeline.md`에, 검토자가 읽는 권위 입력은 `01-input/user-decisions.json`에 남습니다.
 
 ## 용어
 
@@ -101,9 +101,11 @@ python3 .claude/skills/ensemble/scripts/review.py resolve-user-decision \
 
 - 일반 검토의 입력 묶음에는 전체 이슈 기록, 작성자 결정, 이전 점수를 넣지 않습니다.
 - 일반 검토 세션은 요청 해시와 실행 ID가 모두 같은 경우에만 이어서 사용합니다.
-- 최종 독립 검토에는 요청, 완료 기준, 최종 초안만 전달합니다.
+- 최종 독립 검토에는 요청, 완료 기준, 권위 있는 사용자 결정, 최종 초안만 전달합니다.
+- `final.md`에는 상태 헤더나 리뷰 이력 부록을 붙이지 않습니다. 상태와 이견은 manifest·registry·timeline에서 확인합니다.
 - 검토 결과와 초안 사본은 덮어쓰지 않습니다.
-- 최대 반복 횟수에 도달해도 승인으로 처리하지 않습니다.
+- 일반 검토·최종 독립 검토·전체 provider 호출 한도를 따로 적용하며, 한도 도달을 승인으로 처리하지 않습니다.
+- 최종 검토 이슈를 승격하면 다음 일반 검토는 새 Codex 세션에서 시작합니다.
 - 추가 평가자를 사용할 수 없으면 임의로 결론 내리지 않고 사용자에게 선택을 요청합니다.
 - 요청에 비밀정보로 보이는 내용이 있으면 실행을 막습니다.
 - 실행 중 Ensemble 코드가 바뀌면 해당 실행을 중단하고 새 실행을 요구합니다.
@@ -115,6 +117,7 @@ python3 .claude/skills/ensemble/scripts/review.py resolve-user-decision \
 python3 .claude/skills/ensemble/scripts/review.py measure-noise --run <run_dir> --repetitions 3
 python3 .claude/skills/ensemble/scripts/review.py issue-audit --run <run_dir> --round <N>
 python3 .claude/skills/ensemble/scripts/review.py panel --run <run_dir> --issue <R1-I1>
+python3 .claude/skills/ensemble/scripts/review.py preflight --live-agy
 ```
 
 이 명령들은 판정이 얼마나 안정적인지 확인하고, 추가 판단이 필요한지 알려줍니다. 자동 승인을 만들지는 않습니다.
@@ -133,14 +136,25 @@ python3 .claude/skills/ensemble/scripts/review.py eval-quality --run <run_dir>
 
 # 3층 — 고정 케이스 세트로 코드 버전을 평가하고 커밋 간에 비교합니다.
 python3 .claude/skills/ensemble/scripts/review.py eval-bench --suite smoke
+python3 .claude/skills/ensemble/scripts/review.py eval-bench --suite full --repeat 3
 python3 .claude/skills/ensemble/scripts/review.py eval-bench --collect --suite smoke --benchmark-run-id <id>
 python3 .claude/skills/ensemble/scripts/review.py eval-compare --base <sha> --head <sha>
 ```
 
 - 평가는 실행 상태를 바꾸지 않습니다. 대상 실행의 `manifest.json`을 건드리지 않고, 평가 중 오류가 나도 실행을 종료 처리하지 않습니다. 결과는 `<run_dir>/eval/`에 남습니다.
 - 어떤 지표도 자동 게이트로 쓰지 않습니다. 실사용 기록으로 분별력이 확인된 뒤에만 게이트 승격을 논의합니다.
-- 토큰은 CLI가 보고한 실측값만 기록합니다. 보고가 없으면 `null`로 두고 호출 횟수만 세며, 금액으로 환산하지 않습니다.
+- 토큰은 실측값만 기록합니다. 프롬프트 길이로 추정하지 않고, 금액으로 환산하지 않습니다.
+- 토큰은 세 주체를 모두 셉니다. **Codex와 Agy는 하한값**입니다 — 사용량을 보고하지 않은 호출이 있으면 그만큼 빠집니다. **작성자(Claude)는 상한값**입니다 — 세션 기록이 실행 단위가 아니라 세션 단위라서, 같은 시간대의 다른 작업이 섞일 수 있습니다. 오차의 방향이 반대이므로 한 숫자로 합치지 않고 제공자별로 표시합니다.
+
+```bash
+# 정지 상태로 멈춰 finalize를 거치지 않은 실행의 작성자 토큰 수집
+python3 .claude/skills/ensemble/scripts/review.py collect-claude-usage --run <run_dir>
+```
+
+`finalize`가 종료 직후 자동으로 부르므로 보통은 직접 실행할 필요가 없습니다. 세션 기록이 없어도 종료를 막지 않고 경고만 남깁니다. 이 명령은 창 전체를 다시 계산해 **대체**하므로 여러 번 실행해도 값이 부풀지 않습니다.
 - 3층 순회는 작성자 단계가 필요하므로 `/ensemble-eval` 스킬이 수행합니다. 케이스 정답지는 사용자가 검토해 `reviewed_by_user: true`로 바꾸기 전까지 `UNREVIEWED`로 표시되고 합계에서 빠집니다.
+- 3층은 상태 사전 채점 실패나 tainted 수집분에 대해 비용이 드는 심판을 호출하지 않습니다. 꼭 필요한 진단에서만 `--force-judge`로 재정의합니다.
+- Agy에는 파일·셸 권한을 열지 않습니다. 검증된 번들 내용을 프롬프트에 직접 싣고, 파일명·크기·해시만 호출 기록에 남깁니다.
 
 ### 심판 안정성 확인
 

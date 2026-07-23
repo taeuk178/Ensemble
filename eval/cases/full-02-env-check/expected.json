@@ -5,11 +5,12 @@
   "case_type": "quality",
   "suites": ["full"],
   "tags": ["cli", "developer-tool", "security-constraint", "scope-creep"],
-  "difficulty": "easy",
-  "expected_terminal_states": ["CONVERGED"],
+  "difficulty": "medium",
+  "expected_terminal_states": ["USER_DECISION_REQUIRED"],
   "forbidden_states": ["ITERATION_LIMIT_REACHED", "OSCILLATING", "PROTOTYPE_INCOMPLETE"],
-  "expect_user_decision": false,
+  "expect_user_decision": true,
   "expect_escalation": false,
+  "notes": "CLI 기본 경로·지원 범위·파싱 규칙은 원문만으로 확정할 수 없어 사용자 결정 지점에서 멈추는 것이 정답입니다.",
   "quality_expectations": {
     "must_cover": [
       ".env.example에는 있으나 .env에는 없는 키를 찾아 보고하는 규칙",

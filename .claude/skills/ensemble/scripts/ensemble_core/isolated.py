@@ -10,6 +10,7 @@ from .hashing import canonical_evidence_anchor, consequence_fingerprint
 from .io_utils import atomic_write_json, read_json
 from .providers import ProviderResult, run_codex
 from .registry import load_registry
+from .state_machine import record_final_blind_attempt, record_provider_call
 from .validation import validate_against_schema, validate_review_schema
 from . import layout
 
@@ -92,6 +93,7 @@ def save_final_assessment(
     detail_path = layout.reconciliation(run_dir, draft_round, suffix)
     atomic_write_json(detail_path, reconciliation, overwrite=False)
     atomic_write_json(layout.final_reconciliation(run_dir), reconciliation)
+    record_final_blind_attempt(run_dir)
     manifest = read_json(layout.manifest(run_dir))
     manifest["latest_final_blind"] = str(raw_path)
     manifest["latest_final_reconciliation"] = str(detail_path)
@@ -117,6 +119,13 @@ def run_final_blind(
             model=model,
             timeout=timeout,
         )
+    record_provider_call(
+        run_dir,
+        provider="codex",
+        operation="final-blind",
+        round_number=layout.round_of(draft_path),
+        result=result,
+    )
     reconciliation = save_final_assessment(
         run_dir, draft_path=draft_path, raw_review=result.payload
     )

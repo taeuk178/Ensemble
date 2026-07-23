@@ -97,6 +97,8 @@ Claude가 명세를 작성하고 GPT가 독립적으로 검토한다. `review.py
    ```
 
    새로 발견된 진행 차단 이슈가 있으면 등록하고 일반 검토로 돌아간다.
+   승격은 일반 검토 횟수를 소비하지 않지만, 확증 편향을 줄이기 위해 기존
+   Codex 검토 세션을 닫고 다음 일반 검토에서 새 세션을 시작한다.
 
    ```bash
    python3 .claude/skills/ensemble/scripts/review.py promote-final --run <run>
@@ -108,21 +110,38 @@ Claude가 명세를 작성하고 GPT가 독립적으로 검토한다. `review.py
    python3 .claude/skills/ensemble/scripts/review.py finalize --run <run> --status auto
    ```
 
-9. 매 명령의 `state`를 확인한다. `USER_DECISION_REQUIRED`, `ESCALATION_REQUIRED`, `PANEL_DISSENT`에서는 자동으로 진행하지 않는다. 사용자 선택을 받은 뒤 아래 명령으로 재개하거나 위험 수용을 기록한다.
+9. 매 명령의 `state`를 확인한다. `USER_DECISION_REQUIRED`, `ESCALATION_REQUIRED`, `PANEL_DISSENT`에서는 자동으로 진행하지 않는다. 사용자 선택을 받은 뒤 권위 있는 결정 내용을 구조화 JSON으로 기록해 재개하거나 위험 수용을 기록한다.
+
+   ```json
+   {
+     "action": "REVISE",
+     "audit_note": "사용자와 기본 경로를 확정했다.",
+     "authoritative_decisions": [
+       {
+         "decision": "기본 입력은 현재 디렉터리의 .env이다.",
+         "supersedes": []
+       }
+     ]
+   }
+   ```
 
    ```bash
    python3 .claude/skills/ensemble/scripts/review.py resolve-user-decision \
-     --run <run> --action REVISE --note-file <user-decision.txt>
+     --run <run> --decision-file <user-decision.json>
    python3 .claude/skills/ensemble/scripts/review.py accept-risk \
      --run <run> --issue <id> --round <N> --note-file <note>
    ```
 
-   문서를 고치지 않고 검토만 이어가려면 `--action CONTINUE`를 사용한다.
+   문서를 고치지 않고 검토만 이어가려면 JSON의 `action`을 `CONTINUE`로 둔다.
+   기록된 결정은 `01-input/user-decisions.json`에 투영되어 다음 일반·최종·패널
+   검토의 권위 입력으로 전달된다. 기존 결정을 바꾸면 해당 ID를 `supersedes`에
+   넣는다.
 
 ## 오류 처리
 
 - `SCHEMA_ERROR`(형식 오류), `SEMANTIC_VALIDATION_ERROR`(내용 규칙 오류), `INFRA_ERROR`(실행 환경 오류)를 구분해 보고한다.
-- 최대 반복 횟수에 도달하면 승인하지 않고 `ITERATION_LIMIT_REACHED`로 끝낸다.
+- 일반 검토, 최종 독립 검토, 전체 provider 호출 한도를 각각 센다. 어느 한도든
+  다음 필수 단계를 수행할 수 없으면 승인하지 않고 `ITERATION_LIMIT_REACHED`로 끝낸다.
 - 최종 독립 검토 원본은 수정하지 않는다. 위험 수용 대조 결과는 `final-reconciliation.json`에서 확인한다.
 - 전체 흐름은 `timeline.md`에서 확인한다. 세부 근거는 `decisions.md`, `reviews/`, `issue-registry.json`을 기준으로 한다.
 - 실행 중 Ensemble 코드가 바뀌어 `RUN_TAINTED`가 되면 해당 실행을 버리고 새로 시작한다.

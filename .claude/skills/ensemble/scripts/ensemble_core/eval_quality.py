@@ -17,7 +17,7 @@ from typing import Any
 from .bundle import isolated_bundle
 from .config import JUDGE_AXES, REFERENCE_ROOT
 from .environment import ensemble_source_hash, git_commit
-from .errors import StateError
+from .errors import InfraError, StateError
 from .io_utils import atomic_write_json, read_json, sha256_text, utc_now
 from .providers import ProviderResult, run_agy
 from .state_machine import accumulate_usage
@@ -56,7 +56,7 @@ def _next_raw_index(run_dir: Path) -> int:
     if not raw_dir.exists():
         return 1
     used = []
-    for path in raw_dir.glob("call-*.json"):
+    for path in [*raw_dir.glob("call-*.json"), *raw_dir.glob("failure-*.json")]:
         try:
             used.append(int(path.stem.split("-", 1)[1]))
         except ValueError:
@@ -185,9 +185,43 @@ def run_quality_eval(
                 if order == "DRAFT_FIRST"
                 else {"document-1.md": final_text, "document-2.md": draft_text}
             )
-            provider_result = _judge_once(
-                run_dir, documents=documents, model=model, effort=effort, timeout=timeout
-            )
+            try:
+                provider_result = _judge_once(
+                    run_dir, documents=documents, model=model, effort=effort, timeout=timeout
+                )
+            except InfraError as exc:
+                details = exc.details if isinstance(exc.details, dict) else {}
+                attempts = int(details.get("attempts") or 1)
+                failure_path = layout.judge_failure(run_dir, raw_index)
+                atomic_write_json(
+                    failure_path,
+                    {
+                        "recorded_at": utc_now(),
+                        "provider": details.get("provider", "agy"),
+                        "error": exc.message,
+                        "details": details,
+                    },
+                    overwrite=False,
+                )
+                accumulate_usage(
+                    usage_holder,
+                    "agy",
+                    None,
+                    attempts=attempts,
+                    attempts_reported=0,
+                )
+                result = {
+                    **base,
+                    **document_info,
+                    "content_identical": False,
+                    "verdict": "INFRA_ERROR",
+                    "reason": exc.message,
+                    "calls": calls,
+                    "failure_record": failure_path.relative_to(run_dir).as_posix(),
+                    "usage_total": usage_holder.get("usage", {}).get("agy"),
+                }
+                _write_judgment(run_dir, result)
+                return result
             cli_version = provider_result.version
             raw_path = layout.judge_raw(run_dir, raw_index)
             atomic_write_json(raw_path, provider_result.payload, overwrite=False)

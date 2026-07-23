@@ -41,6 +41,18 @@ def _copy_checked(source: Path, destination: Path, run_dir: Path) -> None:
     shutil.copyfile(resolved, destination)
 
 
+def _copy_user_decisions(run_dir: Path, destination: Path) -> None:
+    """구버전 실행에는 projection이 없으므로 빈 권위 입력으로 읽는다."""
+    source = layout.user_decisions(run_dir)
+    if source.exists():
+        _copy_checked(source, destination, run_dir)
+        return
+    destination.write_text(
+        json.dumps({"schema_version": 1, "decisions": []}, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
 def prepare_review_session_bundle(
     run_dir: Path,
     *,
@@ -76,6 +88,8 @@ def prepare_review_session_bundle(
     }
     for name, source in sources.items():
         _copy_checked(source, bundle_dir / name, run_dir)
+    _copy_user_decisions(run_dir, bundle_dir / "user-decisions.json")
+    sources["user-decisions.json"] = layout.user_decisions(run_dir)
     audit_path = layout.bundles_dir(run_dir) / f"{uuid.uuid4().hex}.json"
     atomic_write_json(
         audit_path,
@@ -108,6 +122,8 @@ def isolated_bundle(
         bundle_dir = Path(temporary)
         _copy_checked(layout.request(run_dir), bundle_dir / "request.md", run_dir)
         _copy_checked(layout.rubric(run_dir), bundle_dir / "rubric.md", run_dir)
+        if mode != "proposal":
+            _copy_user_decisions(run_dir, bundle_dir / "user-decisions.json")
         if draft_path is not None:
             _copy_checked(draft_path, bundle_dir / "draft.md", run_dir)
         if mode == "review":
@@ -130,8 +146,8 @@ def isolated_bundle(
             (bundle_dir / "new-issues.json").write_text(
                 json.dumps(audit_issues, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
             )
-        # 심판 문서는 생성 헤더를 제거한 사본이라 원본 경로 복사 대신
-        # 내용을 직접 쓴다. 파일명 검증은 아래 allowlist가 그대로 수행한다.
+        # 심판은 어느 쪽이 최종본인지 드러나지 않는 중립 파일명이 필요하므로
+        # 원본 경로 복사 대신 document-N 이름으로 내용을 직접 쓴다.
         for name, text in (inline_documents or {}).items():
             (bundle_dir / name).write_text(text, encoding="utf-8")
         if mode.startswith("judge"):

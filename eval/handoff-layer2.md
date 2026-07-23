@@ -4,7 +4,7 @@
 >
 > 목적: 앙상블의 핵심 가설인 **"검토 루프가 문서를 실제로 개선했는가"**를 측정한다. 모든 완료된 실행에는 비교 자료가 이미 들어 있다 — 검토 전 첫 초안(`03-drafts/draft-00.md`)과 최종화에 사용된 마지막 초안(`03-drafts/draft-NN.md`)이다. 루프 밖 심판 모델이 두 문서를 어느 쪽이 나중인지 모른 채 비교한다.
 >
-> `final.md`를 쓰지 않는 이유: `final.md`는 마지막 초안에 보고 단계(`finalize`)가 상태 헤더와 미해결 이견·수용 위험 부록을 덧붙인 **전달물**이다. 부록에는 리뷰 이력이 원문 그대로 들어 있어 블라인드를 깨고, 애초에 검토 루프가 만든 명세가 아니다. 루프의 산출물은 초안이므로 초안끼리 비교한다. 이렇게 하면 생성 표식을 제거하는 정규화 규칙 자체가 필요 없다. 전달물 전체의 품질이 궁금해지면 별도 지표로 다룬다.
+> `final.md`를 직접 쓰지 않는 이유: 현재 finalize는 상태 헤더와 리뷰 부록을 제거해 최종 초안 본문만 전달하지만, 평가 계약은 보고 파일 형식과 분리한다. 루프의 원천 산출물인 초안을 직접 선택하면 향후 전달물 형식이 바뀌어도 블라인드 비교가 흔들리지 않는다.
 
 ## 1. 입력과 출력
 
@@ -25,12 +25,16 @@ python3 .claude/skills/ensemble/scripts/review.py eval-quality --run <run_dir> [
 - escalation이 발생한 실행에서는 panel과 심판이 같은 모델이 되는 순환이 있다. 결과에 `judge_model`과 `panel_used_in_run: bool`을 함께 기록해 보고 시 걸러낼 수 있게 한다.
 - 프롬프트와 스키마는 `references/judge-prompt.md`, `references/judge.schema.json`으로 추가한다. 기존 panel 프롬프트와 같은 검증 경로(`validate_against_schema`)를 쓴다.
 - `agy` 1.1.5는 사용량을 보고하지 않는 것으로 확인됐다(상위 문서 §4.4). 심판 호출의 `usage`는 `null`로, 호출 수는 `calls_unreported`로 기록한다.
+- Agy headless에는 파일 또는 command 권한을 열지 않는다. 번들의 allowlist 파일을
+  프롬프트에 직접 삽입하고 도구 사용을 금지한다. 권한 거부나 기타 인프라 오류는
+  `eval/judge-raw/failure-N.json`에 남기고 `verdict: INFRA_ERROR`로 반환하며,
+  대상 실행의 manifest는 바꾸지 않는다.
 
 ## 3. 블라인드 규칙
 
 `FINAL_BLIND`와 같은 격리 원칙을 따른다.
 
-- 심판 입력 번들: 해당 실행의 `request.md`, `rubric.md`, 그리고 두 문서를 `document-1.md`, `document-2.md`로 복사한 것. **그 외에는 아무것도 넣지 않는다.** 리뷰 이력, 이슈 기록, 초안 라운드 번호, 파일 수정 시각 등 어느 쪽이 최종본인지 추론할 단서를 제거한다.
+- 심판 입력 번들: 해당 실행의 `request.md`, `rubric.md`, 권위 사용자 결정 `user-decisions.json`, 그리고 두 문서를 `document-1.md`, `document-2.md`로 복사한 것. **그 외에는 아무것도 넣지 않는다.** 리뷰 이력, 이슈 기록, 초안 라운드 번호, 파일 수정 시각 등 어느 쪽이 최종본인지 추론할 단서를 제거한다.
 - 번들 구성은 기존 `bundle.py`의 allowlist 방식을 재사용한다.
 - 호출 1은 (문서1=draft-0, 문서2=final), 호출 2는 순서를 바꾼다. 매핑은 `quality-judgment.json`에만 기록한다.
 - 비교 대상이 초안끼리이므로(`final.md` 미사용, §1) 생성 표식을 제거하는 정규화는 필요 없다. 초안은 어떤 가공도 없이 그대로 전달한다.
@@ -133,7 +137,7 @@ python3 .claude/skills/ensemble/scripts/review.py eval-quality --run <run_dir> [
 
 ## 9. 완료 기준
 
-- [ ] **미완료** — 완료된 실제 실행 1건에서 live 호출로 `quality-judgment.json`이 생성된다. 모의 호출로만 검증했으며 `agy` 실호출 확인이 남았다
+- [x] 실제 실행에서 Agy headless의 파일 권한 실패가 재현됐고, 입력 인라인화·실패 산출물 기록·실행 상태 격리를 구현했다. `preflight --live-agy`로 동일 전달 경로를 사전 확인한다
 - [x] `measure-noise`처럼 반복 실행으로 심판 안정성을 확인하는 절차가 README 평가 명령 절에 문서화된다
 - [x] 위 테스트가 모두 통과한다
 - [ ] **미완료** — 심판 프롬프트(`judge-prompt.md`)를 사용자가 검토했다 (정답지 원칙)

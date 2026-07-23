@@ -31,7 +31,8 @@ allowed-tools: Bash(python3 .claude/skills/ensemble/scripts/review.py *)
   맞추면 측정 대상이 사라진다. 채점은 `eval-bench --collect`가 한다.
 - 사용자 개입 지점(`USER_DECISION_REQUIRED`, `ESCALATION_REQUIRED`,
   `PANEL_DISSENT`)에 도달하면 **그 상태 자체가 채점 대상이므로 재개하지 않는다.**
-  상태를 기록하고 다음 케이스로 넘어간다.
+  상태를 기록하고 다음 케이스로 넘어간다. `resolve-user-decision`도 벤치마크
+  manifest가 있는 실행의 재개를 거부한다.
 - 케이스 하나가 실패해도 순회를 멈추지 않는다. 실패를 기록하고 계속한다.
 
 ## 작업 순서
@@ -41,6 +42,9 @@ allowed-tools: Bash(python3 .claude/skills/ensemble/scripts/review.py *)
    ```bash
    python3 .claude/skills/ensemble/scripts/review.py eval-bench --suite smoke
    ```
+
+   기본은 케이스당 1회다. 단일 실행에서 나온 회귀 신호를 재확인할 때만
+   `--repeat N`을 사용한다.
 
    출력의 `benchmark_run_id`를 이 순회 내내 그대로 쓴다. `pending_runs`가 이
    스킬이 직접 실행해야 할 케이스 목록이다.
@@ -64,11 +68,18 @@ allowed-tools: Bash(python3 .claude/skills/ensemble/scripts/review.py *)
    2번부터를 그대로 따른다. 벤치마크라고 절차를 줄이지 않는다 — 줄이면 측정 대상이
    실제 파이프라인이 아니게 된다.
 
-4. 케이스가 끝나거나 멈추면 `status`로 상태를 확인하고 다음 케이스로 넘어간다.
+4. 케이스가 끝나거나 멈추면 상태를 확인하고, **정지 상태로 멈춘 케이스는 작성자
+   토큰을 직접 수집한 뒤** 다음 케이스로 넘어간다. `finalize`까지 간 케이스는
+   종료 시 자동으로 수집되므로 다시 부를 필요가 없다.
 
    ```bash
    python3 .claude/skills/ensemble/scripts/review.py status --run <run>
+   python3 .claude/skills/ensemble/scripts/review.py collect-claude-usage --run <run>
    ```
+
+   **케이스 사이에 다른 작업을 끼워 넣지 않는다.** 작성자 토큰은 실행의 시간
+   창으로 귀속되므로, 창에 무관한 작업이 섞이면 그 케이스의 비용이 부풀려진다.
+   케이스를 순서대로 하나씩 끝내면 창이 서로 겹치지 않아 귀속이 깨끗하다.
 
 5. 모든 케이스가 끝나면 점수표를 만든다. 품질 케이스가 있으면 이 단계에서
    정답지 채점 심판이 호출된다.
@@ -78,7 +89,9 @@ allowed-tools: Bash(python3 .claude/skills/ensemble/scripts/review.py *)
      --suite smoke --benchmark-run-id <1단계에서 받은 값>
    ```
 
+   상태 사전 채점이 실패했거나 수집분이 tainted이면 심판을 자동으로 생략한다.
    심판 호출 없이 상태 채점만 하려면 `--skip-expectation-judge`를 쓴다.
+   진단 목적으로만 이 보호를 무시할 때는 `--force-judge`를 명시한다.
 
 6. 선택: 각 실행의 1층·2층 지표를 채운다. 2층은 실행당 심판 2회를 쓴다.
 
@@ -99,6 +112,10 @@ allowed-tools: Bash(python3 .claude/skills/ensemble/scripts/review.py *)
   `reviewed_by_user: true`로 바꿔야 합계에 들어간다고 알린다.
   **이 값을 대신 바꾸지 않는다.**
 - 케이스당 1회 실행의 판정 차이는 "회귀"가 아니라 **"회귀 신호"**로 표현한다.
+- 토큰 합계는 제공자별로 나눠 보고하고 오차의 방향을 함께 밝힌다. Codex와 Agy는
+  **하한값**, 작성자(Claude)는 **상한값**이다. 세 숫자를 하나로 합치지 않는다.
+- 심판이 실패하면 실행 상태는 바꾸지 않고 `eval/judge-raw/failure-N.json`과
+  `quality_judgment.judge_status: INFRA_ERROR`로 별도 기록한다.
 
 ## 커밋 간 비교
 

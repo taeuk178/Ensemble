@@ -23,7 +23,10 @@ python3 .claude/skills/ensemble/scripts/review.py eval-run --run <run_dir>
 
 | 지표 | 원천 | 계산 |
 |---|---|---|
-| `review_rounds` | `manifest.review_history` | 항목 수 |
+| `review_rounds`, `iterative_reviews` | `manifest.counters.iterative_reviews` | 일반 검토 횟수. 승격이 사용한 시퀀스 번호는 제외 |
+| `sequence_rounds` | `manifest.review_history` | 일반 검토와 승격을 모두 포함한 시퀀스 항목 수 |
+| `promotions` | `manifest.counters.promotions` | FINAL_BLIND 발견 승격 횟수 |
+| `review_session_resets` | `manifest.review_session_policy.reset_count` | 승격 후 검토자 세션을 초기화한 횟수 |
 | `draft_rounds` | `manifest.review_history[].draft_round` | 최대값 + 1 |
 | `final_state` | `manifest.state` | 그대로 |
 | `terminated_cleanly` | `manifest.state` | `CONVERGED` 또는 `STABLE_DISSENT`면 true |
@@ -46,11 +49,14 @@ python3 .claude/skills/ensemble/scripts/review.py eval-run --run <run_dir>
 | `unique_promoted_final_blind_blockers` | registry | `first_seen_source`가 `04-reviews/promoted/`인 이슈 수 (FINAL_BLIND 발견은 승격을 통해서만 registry에 들어간다) |
 | `unpromoted_unaccepted_last_attempt` | 마지막 reconciliation | 승격되지 않고 남은 `unaccepted_blocking_findings` 수. 0이 아니면 `warnings`에 기록 |
 | `leakage_rate_lower_bound` | 위 값 | `unique_promoted_final_blind_blockers / (unique_iterative_origin_blockers + unique_promoted_final_blind_blockers)`. 분모가 0이면 `null` |
+| `unique_observed_final_blind_blockers` | 모든 reconciliation | `(criterion_id, consequence_fingerprint)`로 시도 간 중복 제거한 미수용 발견 수 |
+| `unique_unpromoted_final_blind_blockers` | 위 값 + registry | 관측 고유 발견 수에서 승격 기원 고유 이슈 수를 뺀 값 |
+| `leakage_rate_observed` | 위 값 | `unique_observed_final_blind_blockers / (unique_iterative_origin_blockers + unique_observed_final_blind_blockers)`. 반복 발견을 제거한 실측 보조값 |
 
 하한값임을 이름에 드러낸다(`_lower_bound`). 알려진 한계 (출력 `warnings`에 함께 기록):
 
 - 승격되지 않은 unaccepted 발견(예: 반복 한도 도달로 종료된 실행)은 registry에 없어 분자에서 빠진다. `unpromoted_unaccepted_last_attempt`가 그 보정 단서다.
-- reconciliation의 `UNMATCHED:` 앵커는 시도별 salt가 섞여 있어 시도 간 중복 제거에 쓸 수 없다. `attempts[]`는 중복 제거 없이 원 수치만 보고한다. (개선 후보: salt가 없는 정상 앵커는 `canonical_evidence_anchor` + `consequence_fingerprint`로 시도 간 중복 제거가 가능하다. MVP에서는 하지 않는다.)
+- reconciliation의 `UNMATCHED:` 앵커는 시도별 salt가 섞여 있어 직접 중복 제거에 쓰지 않는다. 관측 보조값은 기준과 구현 결과가 같은 발견을 `(criterion_id, consequence_fingerprint)`로 묶는다. 표현이 크게 바뀐 같은 결함은 별개로 셀 수 있으므로 `leakage_rate_observed`도 추정치다.
 - `first_seen_source`가 없는 이슈(구버전 실행)는 `unknown_origin_blockers`로 따로 세고 비율에서 제외한다.
 
 2차 시도에서도 `unaccepted_findings`가 나오면 수정이 새 문제를 만들고 있다는 신호다.

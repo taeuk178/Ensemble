@@ -16,7 +16,7 @@ from ensemble_core.bundle import isolated_bundle, prepare_review_session_bundle
 from ensemble_core.audit import apply_audit
 from ensemble_core.cards import build_feedback_cards, build_panel_card
 from ensemble_core.convergence import refresh_author_dispositions, reproducibility_metrics
-from ensemble_core.errors import InputError, SchemaError, SecurityError, SemanticValidationError, StateError
+from ensemble_core.errors import InfraError, InputError, SchemaError, SecurityError, SemanticValidationError, StateError
 from ensemble_core.hashing import canonical_issue_key, parse_sections, refs_changed, section_hashes
 from ensemble_core.history import write_timeline
 from ensemble_core import layout
@@ -27,6 +27,7 @@ from ensemble_core.registry import accept_risk, load_registry, record_author_dec
 from ensemble_core.report import finalize
 from ensemble_core.state_machine import (
     assert_run_can_advance,
+    assert_final_blind_budget,
     assert_source_unchanged,
     initialize_run,
     load_codex_review_session,
@@ -36,7 +37,7 @@ from ensemble_core.state_machine import (
     verified_request_hash,
 )
 from ensemble_core.validation import validate_review_schema
-from ensemble_core.workflow import ingest_review, run_review
+from ensemble_core.workflow import ingest_review, promote_final_findings, run_review
 
 
 def issue(*, issue_id: str | None = None, severity: int = 4, response: str | None = None) -> dict[str, object]:
@@ -85,6 +86,8 @@ class RunCase(unittest.TestCase):
         self.patches = [
             patch("ensemble_core.state_machine.RUNS_ROOT", self.runs),
             patch("ensemble_core.io_utils.RUNS_ROOT", self.runs),
+            # 테스트가 사용자 홈의 실제 세션 기록을 읽지 않게 한다.
+            patch("ensemble_core.config.CLAUDE_TRANSCRIPT_ROOT", self.root / "transcripts"),
         ]
         for item in self.patches:
             item.start()
@@ -536,6 +539,28 @@ class AcceptedRiskTests(RunCase):
         self.assertEqual(stored, raw)
         self.assertTrue(result["passed"])
 
+    def test_final_promotion_resets_reviewer_session_without_using_review_budget(self) -> None:
+        ingest_review(self.run, review=review(), review_round=1)
+        workspace = layout.review_sessions_dir(self.run) / "test"
+        workspace.mkdir(parents=True)
+        record_codex_review_session(
+            self.run,
+            session_id="session-before-promotion",
+            review_round=1,
+            workspace=workspace,
+        )
+        save_final_assessment(
+            self.run,
+            draft_path=layout.draft(self.run, 0),
+            raw_review=review(blockers=[issue()]),
+        )
+        promote_final_findings(self.run)
+        current = read_json(layout.manifest(self.run))
+        self.assertEqual(current["counters"]["iterative_reviews"], 1)
+        self.assertEqual(current["counters"]["promotions"], 1)
+        self.assertIsNone(current["codex_review_session"])
+        self.assertEqual(current["review_session_policy"]["reset_count"], 1)
+
 
 class BundleAndReportTests(RunCase):
     def test_manifest_uses_agy_panel_provider(self) -> None:
@@ -551,7 +576,10 @@ class BundleAndReportTests(RunCase):
             mode="final",
             draft_path=layout.draft(self.run, 0),
         ) as bundle:
-            self.assertEqual({path.name for path in bundle.iterdir()}, {"request.md", "rubric.md", "draft.md"})
+            self.assertEqual(
+                {path.name for path in bundle.iterdir()},
+                {"request.md", "rubric.md", "user-decisions.json", "draft.md"},
+            )
 
     def test_auto_finalize_converges_after_clean_final(self) -> None:
         ingest_review(self.run, review=review(), review_round=1)
@@ -563,6 +591,62 @@ class BundleAndReportTests(RunCase):
         result = finalize(self.run, status="auto")
         self.assertEqual(result["status"], "CONVERGED")
         self.assertTrue(layout.final(self.run).exists())
+        self.assertEqual(
+            layout.final(self.run).read_text(encoding="utf-8").strip(),
+            layout.draft(self.run, 0).read_text(encoding="utf-8").strip(),
+        )
+        self.assertNotIn("ensemble-status", layout.final(self.run).read_text(encoding="utf-8"))
+
+    def test_authoritative_user_decisions_are_projected_for_reviewers(self) -> None:
+        current = read_json(layout.manifest(self.run))
+        current["state"] = "USER_DECISION_REQUIRED"
+        atomic_write_json(layout.manifest(self.run), current)
+        event = resolve_user_decision(
+            self.run,
+            action="REVISE",
+            note="기본 경로를 확정",
+            authoritative_decisions=[
+                {"decision": "기본 입력은 현재 디렉터리의 .env이다.", "supersedes": []}
+            ],
+        )
+        projection = read_json(layout.user_decisions(self.run))
+        self.assertEqual(event["authoritative_decision_ids"], ["UD-001"])
+        self.assertEqual(projection["decisions"][0]["source"], "USER")
+        with isolated_bundle(
+            self.run,
+            mode="final",
+            draft_path=layout.draft(self.run, 0),
+        ) as bundle:
+            self.assertEqual(
+                read_json(bundle / "user-decisions.json")["decisions"][0]["decision_id"],
+                "UD-001",
+            )
+
+    def test_benchmark_run_cannot_resume_after_user_decision_state(self) -> None:
+        current = read_json(layout.manifest(self.run))
+        current["state"] = "USER_DECISION_REQUIRED"
+        current["benchmark"] = {
+            "benchmark_run_id": "bench-1",
+            "case_id": "case-1",
+            "case_revision_hash": "h",
+            "suite": "smoke",
+            "repeat_index": 1,
+        }
+        atomic_write_json(layout.manifest(self.run), current)
+        with self.assertRaises(StateError) as raised:
+            resolve_user_decision(self.run, action="CONTINUE", note="계속")
+        self.assertTrue(raised.exception.details["benchmark_case_completed"])
+
+    def test_final_blind_attempt_budget_is_independent(self) -> None:
+        for _ in range(3):
+            save_final_assessment(
+                self.run,
+                draft_path=layout.draft(self.run, 0),
+                raw_review=review(),
+            )
+        with self.assertRaises(StateError) as raised:
+            assert_final_blind_budget(self.run)
+        self.assertEqual(raised.exception.details["limit_kind"], "FINAL_BLIND_ATTEMPTS")
 
     def test_run_ids_are_unique(self) -> None:
         second = initialize_run("오류 처리 문서", allow_reuse=True)
@@ -618,6 +702,7 @@ class ProviderCommandTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            (root / "issue.json").write_text('{"issue":"embedded"}\n', encoding="utf-8")
             schema = root / "panel.schema.json"
             schema.write_text(
                 (
@@ -672,11 +757,63 @@ class ProviderCommandTests(unittest.TestCase):
         self.assertEqual(command[command.index("--mode") + 1], "plan")
         self.assertIn("--sandbox", command)
         self.assertNotIn("--dangerously-skip-permissions", command)
-        self.assertIn("Return JSON matching this schema exactly", command[command.index("-p") + 1])
+        inline_prompt = command[command.index("-p") + 1]
+        self.assertIn("Return JSON matching this schema exactly", inline_prompt)
+        self.assertIn('{"issue":"embedded"}', inline_prompt)
+        self.assertIn("Do not use tools or commands", inline_prompt)
         self.assertEqual(captured["cwd"], root)
         self.assertIsNone(captured["input"])
         self.assertEqual(result.payload, payload)
         self.assertEqual(result.reasoning_effort, "high")
+        self.assertEqual([item["name"] for item in result.input_manifest], ["issue.json"])
+
+    def test_agy_permission_denial_fails_without_repeating(self) -> None:
+        from ensemble_core.providers import run_agy
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            schema = root / "schema.json"
+            schema.write_text(
+                json.dumps(
+                    {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["ok"],
+                        "properties": {"ok": {"type": "boolean"}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            calls = 0
+
+            def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
+                nonlocal calls
+                if "--version" in command:
+                    return SimpleNamespace(returncode=0, stdout="1.1.5", stderr="")
+                calls += 1
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="",
+                    stderr=(
+                        'jetski: no output produced — a tool required the "command" '
+                        "permission that headless mode cannot prompt for, so it was auto-denied."
+                    ),
+                )
+
+            with patch("ensemble_core.providers.shutil.which", return_value="/fake/agy"), patch(
+                "ensemble_core.providers.subprocess.run", side_effect=fake_run
+            ):
+                with self.assertRaises(InfraError) as raised:
+                    run_agy(
+                        bundle_dir=root,
+                        prompt="PROMPT",
+                        schema_path=schema,
+                        schema_kind="test",
+                        model="m",
+                        retries=2,
+                    )
+        self.assertEqual(calls, 1)
+        self.assertEqual(raised.exception.details["last_error"]["kind"], "permission_denied")
 
     def test_codex_invocation_uses_isolation_flags_and_stdin(self) -> None:
         from ensemble_core.providers import run_codex
@@ -727,6 +864,56 @@ class ProviderCommandTests(unittest.TestCase):
             self.assertEqual(result.payload, payload)
             self.assertIn("model_reasoning_effort=high", command)
             self.assertEqual(result.reasoning_effort, "high")
+
+    def test_failed_codex_call_keeps_usage_from_every_attempt(self) -> None:
+        from ensemble_core.providers import run_codex
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            schema = root / "schema.json"
+            schema.write_text(
+                json.dumps(
+                    {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["ok"],
+                        "properties": {"ok": {"type": "boolean"}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            attempt = 0
+
+            def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
+                nonlocal attempt
+                if "--version" in command:
+                    return SimpleNamespace(returncode=0, stdout="codex-cli test", stderr="")
+                attempt += 1
+                event = {
+                    "type": "turn.completed",
+                    "usage": {"input_tokens": attempt * 10, "output_tokens": attempt},
+                }
+                return SimpleNamespace(
+                    returncode=1,
+                    stdout=json.dumps(event),
+                    stderr="failed",
+                )
+
+            with patch("ensemble_core.providers.shutil.which", return_value="/fake/codex"), patch(
+                "ensemble_core.providers.subprocess.run", side_effect=fake_run
+            ):
+                with self.assertRaises(InfraError) as raised:
+                    run_codex(
+                        bundle_dir=root,
+                        prompt="PROMPT",
+                        schema_path=schema,
+                        schema_kind="test",
+                        model="m",
+                        retries=1,
+                    )
+        self.assertEqual(raised.exception.details["usage"]["input_tokens"], 30)
+        self.assertEqual(raised.exception.details["usage"]["output_tokens"], 3)
+        self.assertEqual(raised.exception.details["attempts_reported"], 2)
 
     def test_codex_review_session_is_created_then_resumed(self) -> None:
         from ensemble_core.providers import run_codex

@@ -10,6 +10,7 @@ import json
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,14 +19,17 @@ SCRIPT_ROOT = Path(__file__).resolve().parents[1] / ".claude" / "skills" / "ense
 sys.path.insert(0, str(SCRIPT_ROOT))
 
 from ensemble_core import layout
-from ensemble_core.errors import InputError, StateError
+from ensemble_core.claude_usage import collect_usage, record_claude_usage, run_window
+from ensemble_core.errors import InfraError, InputError, StateError
 from ensemble_core.eval_bench import (
+    collect,
     collect_benchmark_runs,
     evaluate_init_block,
     grade_case,
     iter_cases,
     load_case,
     observe_run,
+    plan,
     suite_hash,
     validate_benchmark_block,
     validate_expected,
@@ -171,6 +175,210 @@ class UsageCollectionTests(unittest.TestCase):
         self.assertEqual(totals["input_tokens"], 0)
 
 
+class ClaudeUsageTests(unittest.TestCase):
+    """작성자 사용량 — 세션 기록에서 실측하되 상한값임을 드러낸다."""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.transcripts = self.root / "transcripts"
+        self.transcripts.mkdir()
+        self.project = self.root / "project"
+        self.project.mkdir()
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def entry(
+        self,
+        *,
+        message_id: str,
+        timestamp: str,
+        cwd: str | None = None,
+        model: str = "claude-opus-4-8",
+        input_tokens: int = 10,
+        cache_read: int = 100,
+        cache_write: int = 5,
+        output_tokens: int = 20,
+        entry_type: str = "assistant",
+        session: str = "s1",
+    ) -> dict:
+        return {
+            "type": entry_type,
+            "cwd": cwd if cwd is not None else str(self.project),
+            "timestamp": timestamp,
+            "sessionId": session,
+            "message": {
+                "id": message_id,
+                "model": model,
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "cache_read_input_tokens": cache_read,
+                    "cache_creation_input_tokens": cache_write,
+                    "output_tokens": output_tokens,
+                },
+            },
+        }
+
+    def write(self, entries: list[dict], name: str = "session.jsonl") -> None:
+        (self.transcripts / name).write_text(
+            "".join(json.dumps(entry) + "\n" for entry in entries), encoding="utf-8"
+        )
+
+    def collect(self, start: str = "2026-07-23T00:00:00Z", end: str = "2026-07-23T01:00:00Z") -> dict:
+        return collect_usage(
+            window_start=datetime.fromisoformat(start.replace("Z", "+00:00")),
+            window_end=datetime.fromisoformat(end.replace("Z", "+00:00")),
+            transcript_root=self.transcripts,
+            project_root=self.project,
+        )
+
+    def test_maps_claude_fields_onto_the_shared_usage_shape(self) -> None:
+        self.write([self.entry(message_id="m1", timestamp="2026-07-23T00:10:00Z")])
+        usage = self.collect()
+        self.assertEqual(usage["input_tokens"], 10)
+        self.assertEqual(usage["cached_input_tokens"], 100)
+        self.assertEqual(usage["cache_write_input_tokens"], 5)
+        self.assertEqual(usage["output_tokens"], 20)
+        self.assertEqual(usage["messages_counted"], 1)
+
+    def test_reasoning_tokens_are_marked_unreported_not_measured_zero(self) -> None:
+        self.write([self.entry(message_id="m1", timestamp="2026-07-23T00:10:00Z")])
+        usage = self.collect()
+        # 0이 실측값으로 읽히면 안 된다. Claude API는 이 값을 따로 보고하지 않는다.
+        self.assertEqual(usage["reasoning_output_tokens"], 0)
+        self.assertIn("reasoning_output_tokens", usage["unreported_fields"])
+
+    def test_attribution_is_labelled_as_an_upper_bound(self) -> None:
+        self.write([self.entry(message_id="m1", timestamp="2026-07-23T00:10:00Z")])
+        usage = self.collect()
+        self.assertTrue(usage["upper_bound"])
+        self.assertEqual(usage["attribution"], "session_time_window")
+
+    def test_repeated_lines_for_one_message_are_counted_once(self) -> None:
+        # 같은 메시지가 여러 줄로 기록되며 각 줄이 같은 사용량을 싣는다.
+        self.write(
+            [
+                self.entry(message_id="m1", timestamp="2026-07-23T00:10:00Z"),
+                self.entry(message_id="m1", timestamp="2026-07-23T00:10:01Z"),
+            ]
+        )
+        usage = self.collect()
+        self.assertEqual(usage["messages_counted"], 1)
+        self.assertEqual(usage["output_tokens"], 20)
+
+    def test_messages_outside_the_window_are_excluded(self) -> None:
+        self.write(
+            [
+                self.entry(message_id="before", timestamp="2026-07-22T23:59:59Z"),
+                self.entry(message_id="inside", timestamp="2026-07-23T00:30:00Z"),
+                self.entry(message_id="after", timestamp="2026-07-23T01:00:01Z"),
+            ]
+        )
+        self.assertEqual(self.collect()["messages_counted"], 1)
+
+    def test_other_projects_and_non_assistant_entries_are_excluded(self) -> None:
+        self.write(
+            [
+                self.entry(message_id="elsewhere", timestamp="2026-07-23T00:10:00Z", cwd="/other/repo"),
+                self.entry(message_id="user", timestamp="2026-07-23T00:10:00Z", entry_type="user"),
+                self.entry(message_id="synthetic", timestamp="2026-07-23T00:10:00Z", model="<synthetic>"),
+                self.entry(message_id="ok", timestamp="2026-07-23T00:10:00Z"),
+            ]
+        )
+        self.assertEqual(self.collect()["messages_counted"], 1)
+
+    def test_subdirectory_of_the_project_still_counts(self) -> None:
+        self.write(
+            [
+                self.entry(
+                    message_id="m1",
+                    timestamp="2026-07-23T00:10:00Z",
+                    cwd=str(self.project / "ensemble" / "runs"),
+                )
+            ]
+        )
+        self.assertEqual(self.collect()["messages_counted"], 1)
+
+    def test_usage_is_broken_down_by_model(self) -> None:
+        self.write(
+            [
+                self.entry(message_id="a", timestamp="2026-07-23T00:10:00Z", model="claude-opus-4-8"),
+                self.entry(message_id="b", timestamp="2026-07-23T00:20:00Z", model="claude-sonnet-5"),
+            ]
+        )
+        models = self.collect()["models"]
+        self.assertEqual(sorted(models), ["claude-opus-4-8", "claude-sonnet-5"])
+        self.assertEqual(models["claude-opus-4-8"]["messages"], 1)
+
+    def test_missing_transcripts_report_zero_without_failing(self) -> None:
+        usage = collect_usage(
+            window_start=datetime.fromisoformat("2026-07-23T00:00:00+00:00"),
+            window_end=datetime.fromisoformat("2026-07-23T01:00:00+00:00"),
+            transcript_root=self.root / "absent",
+            project_root=self.project,
+        )
+        self.assertFalse(usage["transcripts_found"])
+        self.assertEqual(usage["messages_counted"], 0)
+
+    def test_window_of_an_unfinished_run_extends_to_the_last_record(self) -> None:
+        window = run_window(
+            {
+                "started_at": "2026-07-23T00:00:00Z",
+                "finished_at": None,
+                "state_history": [{"recorded_at": "2026-07-23T00:40:00Z"}],
+                "provider_calls": [{"recorded_at": "2026-07-23T00:20:00Z"}],
+            }
+        )
+        assert window is not None
+        self.assertEqual(window[1].isoformat(), "2026-07-23T00:40:00+00:00")
+
+    def test_window_needs_a_start_time(self) -> None:
+        self.assertIsNone(run_window({"started_at": None}))
+
+
+class ScorecardUsageSummationTests(unittest.TestCase):
+    """합산해도 오차의 방향이 사라지면 안 된다."""
+
+    def sum(self, *usages: dict) -> dict:
+        from ensemble_core.eval_bench import _sum_usage
+
+        target: dict = {}
+        for usage in usages:
+            _sum_usage(target, usage)
+        return target
+
+    def test_upper_bound_survives_summation(self) -> None:
+        claude = {
+            "input_tokens": 10,
+            "messages_counted": 2,
+            "upper_bound": True,
+            "attribution": "session_time_window",
+            "unreported_fields": ["reasoning_output_tokens"],
+        }
+        totals = self.sum({"claude": claude}, {"claude": claude})
+        self.assertEqual(totals["claude"]["input_tokens"], 20)
+        self.assertEqual(totals["claude"]["messages_counted"], 4)
+        self.assertTrue(totals["claude"]["upper_bound"])
+        self.assertEqual(totals["claude"]["attribution"], "session_time_window")
+        self.assertEqual(totals["claude"]["unreported_fields"], ["reasoning_output_tokens"])
+
+    def test_lower_bound_providers_are_not_labelled_upper_bound(self) -> None:
+        totals = self.sum({"codex": {"input_tokens": 5, "calls_unreported": 1}})
+        self.assertNotIn("attribution", totals["codex"])
+        self.assertFalse(totals["codex"].get("upper_bound", False))
+        self.assertEqual(totals["codex"]["calls_unreported"], 1)
+
+    def test_one_upper_bound_case_marks_the_whole_provider(self) -> None:
+        # 케이스 하나라도 시간 창으로 귀속했으면 그 제공자 합계는 상한값이다.
+        totals = self.sum(
+            {"claude": {"input_tokens": 3}},
+            {"claude": {"input_tokens": 4, "upper_bound": True, "attribution": "session_time_window"}},
+        )
+        self.assertTrue(totals["claude"]["upper_bound"])
+        self.assertEqual(totals["claude"]["input_tokens"], 7)
+
+
 class ProcessMetricsTests(unittest.TestCase):
     """1층 — 결정적 계산. 원천이 없으면 그 지표만 null이 된다."""
 
@@ -247,6 +455,68 @@ class ProcessMetricsTests(unittest.TestCase):
         self.assertEqual(result["leakage"]["unpromoted_unaccepted_last_attempt"], 2)
         self.assertTrue(any("승격되지 않은" in warning for warning in result["warnings"]))
 
+    def test_observed_leakage_deduplicates_repeated_final_findings(self) -> None:
+        def finding(criterion: str, fingerprint: str) -> dict:
+            return {
+                "finding": {"criterion_id": criterion},
+                "consequence_fingerprint": fingerprint,
+            }
+
+        blinds = [
+            ("draft-01.json", {"blocking_issues": [{}, {}, {}]}),
+            ("draft-02.json", {"blocking_issues": [{}, {}]}),
+            ("draft-02-attempt-2.json", {"blocking_issues": [{}, {}, {}]}),
+        ]
+        reconciliations = [
+            (
+                "draft-01.json",
+                {
+                    "accepted_findings": [],
+                    "unaccepted_blocking_findings": [
+                        finding("AC-01", "a"),
+                        finding("AC-02", "b"),
+                        finding("AC-03", "c"),
+                    ],
+                    "passed": False,
+                },
+            ),
+            (
+                "draft-02.json",
+                {
+                    "accepted_findings": [],
+                    "unaccepted_blocking_findings": [
+                        finding("AC-03", "c"),
+                        finding("AC-04", "d"),
+                    ],
+                    "passed": False,
+                },
+            ),
+            (
+                "draft-02-attempt-2.json",
+                {
+                    "accepted_findings": [],
+                    "unaccepted_blocking_findings": [
+                        finding("AC-03", "c"),
+                        finding("AC-04", "d"),
+                        finding("AC-05", "e"),
+                    ],
+                    "passed": False,
+                },
+            ),
+        ]
+        result = compute_process_metrics(
+            manifest(state="ITERATION_LIMIT_REACHED"),
+            convergence(),
+            registry(iterative=5, promoted=3),
+            blinds,
+            reconciliations,
+        )
+        leakage = result["leakage"]
+        self.assertEqual(leakage["leakage_rate_lower_bound"], 3 / 8)
+        self.assertEqual(leakage["unique_observed_final_blind_blockers"], 5)
+        self.assertEqual(leakage["unique_unpromoted_final_blind_blockers"], 2)
+        self.assertEqual(leakage["leakage_rate_observed"], 0.5)
+
     def test_unknown_origin_issues_are_excluded_from_the_rate(self) -> None:
         result = compute_process_metrics(
             manifest(), convergence(), registry(iterative=0, promoted=0, unknown=3), [], []
@@ -304,6 +574,8 @@ class EvalRunCase(unittest.TestCase):
             patch("ensemble_core.state_machine.RUNS_ROOT", self.runs),
             patch("ensemble_core.io_utils.RUNS_ROOT", self.runs),
             patch("ensemble_core.eval_bench.RUNS_ROOT", self.runs),
+            # 테스트가 사용자 홈의 실제 세션 기록을 읽지 않게 한다.
+            patch("ensemble_core.config.CLAUDE_TRANSCRIPT_ROOT", self.root / "transcripts"),
         ]
         for item in self.patches:
             item.start()
@@ -318,6 +590,57 @@ class EvalRunCase(unittest.TestCase):
         path = layout.draft(self.run, round_number)
         atomic_write_text(path, body, overwrite=False)
         return path
+
+
+class ClaudeUsageRecordingTests(EvalRunCase):
+    def transcript_with(self, message_ids: list[str]) -> Path:
+        started = read_json(layout.manifest(self.run))["started_at"]
+        root = self.root / "transcripts"
+        root.mkdir(exist_ok=True)
+        (root / "session.jsonl").write_text(
+            "".join(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "cwd": str(self.run),
+                        "timestamp": started,
+                        "sessionId": "s1",
+                        "message": {
+                            "id": message_id,
+                            "model": "claude-opus-4-8",
+                            "usage": {"input_tokens": 7, "output_tokens": 3},
+                        },
+                    }
+                )
+                + "\n"
+                for message_id in message_ids
+            ),
+            encoding="utf-8",
+        )
+        return root
+
+    def test_recording_replaces_rather_than_accumulates(self) -> None:
+        root = self.transcript_with(["m1", "m2"])
+        project = Path(str(self.run).split("/runs/")[0]).parent
+        for _ in range(3):
+            usage = record_claude_usage(self.run, transcript_root=root, project_root=project)
+        # 세 번 불러도 값이 부풀지 않아야 한다. 창 전체를 다시 계산해 대체한다.
+        self.assertEqual(usage["messages_counted"], 2)
+        self.assertEqual(usage["input_tokens"], 14)
+        stored = read_json(layout.manifest(self.run))["usage"]["claude"]
+        self.assertEqual(stored["input_tokens"], 14)
+        self.assertTrue(stored["upper_bound"])
+
+    def test_recording_does_not_disturb_provider_usage(self) -> None:
+        manifest = read_json(layout.manifest(self.run))
+        manifest["usage"] = {"codex": {"input_tokens": 5, "calls_reported": 1}}
+        atomic_write_json(layout.manifest(self.run), manifest)
+        root = self.transcript_with(["m1"])
+        project = Path(str(self.run).split("/runs/")[0]).parent
+        record_claude_usage(self.run, transcript_root=root, project_root=project)
+        stored = read_json(layout.manifest(self.run))["usage"]
+        self.assertEqual(stored["codex"]["input_tokens"], 5)
+        self.assertEqual(stored["claude"]["input_tokens"], 7)
 
 
 class EvalRunIoTests(EvalRunCase):
@@ -444,7 +767,33 @@ class QualityEvalTests(EvalRunCase):
         with self.judge([judge_payload("DOC2"), judge_payload("DOC1")]):
             run_quality_eval(self.run, model="m", effort="high", timeout=10)
         for names in self.captured_bundles:
-            self.assertEqual(names, {"request.md", "rubric.md", "document-1.md", "document-2.md"})
+            self.assertEqual(
+                names,
+                {
+                    "request.md",
+                    "rubric.md",
+                    "user-decisions.json",
+                    "document-1.md",
+                    "document-2.md",
+                },
+            )
+
+    def test_judge_infrastructure_failure_is_recorded_without_mutating_run(self) -> None:
+        self.finish_run(drafts=["# 초안 0\n", "# 초안 1\n"])
+        before = layout.manifest(self.run).read_text(encoding="utf-8")
+        failure = InfraError(
+            "headless permission denied",
+            details={
+                "provider": "agy",
+                "attempts": 1,
+                "last_error": {"kind": "permission_denied"},
+            },
+        )
+        with patch("ensemble_core.eval_quality.run_agy", side_effect=failure):
+            result = run_quality_eval(self.run, model="m", effort="high", timeout=10)
+        self.assertEqual(result["verdict"], "INFRA_ERROR")
+        self.assertTrue((self.run / result["failure_record"]).exists())
+        self.assertEqual(layout.manifest(self.run).read_text(encoding="utf-8"), before)
 
     def test_consistent_preference_for_the_later_draft(self) -> None:
         self.finish_run(drafts=["# 초안 0\n", "# 초안 1\n"])
@@ -692,6 +1041,18 @@ class BenchmarkBlockTests(unittest.TestCase):
         with self.assertRaises(InputError):
             validate_benchmark_block(payload)
 
+    def test_plan_expands_non_init_cases_by_repeat(self) -> None:
+        quality_case = case(
+            case_type="quality",
+            quality_expectations={"must_cover": ["오류 흐름"], "must_not_assert": []},
+        )
+        with patch("ensemble_core.eval_bench.iter_cases", return_value=[quality_case]):
+            result = plan("full", repeat=3)
+        self.assertEqual(
+            [item["benchmark"]["repeat_index"] for item in result["pending_runs"]],
+            [1, 2, 3],
+        )
+
 
 class CaseCollectionTests(EvalRunCase):
     def start_benchmark_run(self, *, case_id: str, revision: str, benchmark_run_id: str) -> Path:
@@ -823,6 +1184,44 @@ class CollectScorecardTests(EvalRunCase):
         atomic_write_json(layout.manifest(run_dir), current)
         scorecard = collect(suite="smoke", benchmark_run_id="bench-A", timeout=10)
         self.assertEqual(scorecard["totals"]["unreviewed"], 1)
+
+    def test_failed_state_pregrade_does_not_call_the_quality_judge(self) -> None:
+        loaded = self.write_case(
+            "case-q",
+            expected_case(
+                case_type="quality",
+                quality_expectations={"must_cover": ["오류 흐름"], "must_not_assert": []},
+            ),
+            "오류 흐름을 정의한다.",
+        )
+        run_dir = initialize_run(
+            "오류 흐름을 정의한다.",
+            allow_reuse=True,
+            benchmark={
+                "benchmark_run_id": "bench-Q",
+                "case_id": "case-q",
+                "case_revision_hash": loaded["case_revision_hash"],
+                "suite": "smoke",
+                "repeat_index": 1,
+            },
+        )
+        current = read_json(layout.manifest(run_dir))
+        current["state"] = "ITERATION_LIMIT_REACHED"
+        atomic_write_json(layout.manifest(run_dir), current)
+        with patch("ensemble_core.eval_bench.git_dirty", return_value=False), patch(
+            "ensemble_core.eval_bench.judge_expectations"
+        ) as judge:
+            scorecard = collect(
+                suite="smoke",
+                benchmark_run_id="bench-Q",
+                timeout=10,
+            )
+        judge.assert_not_called()
+        self.assertEqual(scorecard["cases"][0]["verdict"], "FAIL")
+        self.assertEqual(
+            scorecard["cases"][0]["quality_judgment"]["judge_status"],
+            "NOT_RUN_STATE_FAILED",
+        )
         self.assertEqual(scorecard["totals"]["pass"], 0)
 
 

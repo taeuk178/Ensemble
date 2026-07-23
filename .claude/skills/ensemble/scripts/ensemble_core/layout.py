@@ -76,6 +76,11 @@ def rubric(run_dir: Path) -> Path:
     return run_dir / "01-input" / "rubric.md"
 
 
+def user_decisions(run_dir: Path) -> Path:
+    """검토자에게 공개해도 되는 후속 사용자 결정의 권위 projection."""
+    return run_dir / "01-input" / "user-decisions.json"
+
+
 # --- 제안 -------------------------------------------------------------
 
 def proposal(run_dir: Path, name: str) -> Path:
@@ -245,6 +250,10 @@ def judge_raw_dir(run_dir: Path) -> Path:
 
 def judge_raw(run_dir: Path, index: int) -> Path:
     return judge_raw_dir(run_dir) / f"call-{index}.json"
+
+
+def judge_failure(run_dir: Path, index: int) -> Path:
+    return judge_raw_dir(run_dir) / f"failure-{index}.json"
 
 
 # --- 벤치마크 케이스와 점수표 ------------------------------------------

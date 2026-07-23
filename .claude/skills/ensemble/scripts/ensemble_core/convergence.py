@@ -6,6 +6,7 @@ from typing import Any
 
 from .config import OPEN_STATUSES
 from .io_utils import atomic_write_json, read_json, utc_now
+from .state_machine import transition_state
 from .registry import load_registry
 from . import layout
 
@@ -161,7 +162,11 @@ def refresh_author_dispositions(run_dir: Path, round_number: int) -> None:
     if signals:
         manifest = read_json(layout.manifest(run_dir))
         phase_three = str(manifest.get("phase")) == "3"
-        manifest["state"] = "ESCALATION_REQUIRED" if phase_three else "USER_DECISION_REQUIRED"
+        transition_state(
+            manifest,
+            "ESCALATION_REQUIRED" if phase_three else "USER_DECISION_REQUIRED",
+            reason="convergence escalation signal",
+        )
         manifest["escalation_signals"] = signals
         if phase_three:
             pending = set(manifest.get("pending_panel_issue_ids", []))
