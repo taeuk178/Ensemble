@@ -5,7 +5,7 @@ import importlib.util
 import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +14,7 @@ from .config import (
     DEFAULT_REVIEW_EFFORT,
     DEFAULT_TIMEOUT_SECONDS,
     INFRA_RETRIES,
+    USAGE_FIELDS,
 )
 from .errors import InfraError, SchemaError
 from .validation import parse_json_output, validate_against_schema
@@ -33,6 +34,15 @@ class ProviderResult:
     reasoning_effort: str | None = None
     session_id: str | None = None
     session_resumed: bool = False
+    # CLI가 보고한 실측 토큰 수만 담는다. 보고가 없으면 None으로 두고
+    # 프롬프트 길이로 추정하지 않는다. 위치 인자로 만드는 호출부가 있어
+    # 순서 실수를 막으려고 키워드 전용으로 둔다.
+    #
+    # 하나의 논리 호출(run_codex/run_agy 1회) 안에서 사용량을 보고한 모든
+    # 시도의 합이다. 재시도로 버려진 응답의 토큰도 이미 소모됐으므로 포함한다.
+    usage: dict[str, int] | None = field(default=None, kw_only=True)
+    # 위 합계에 기여한 시도 수. `attempts`보다 작으면 합계는 하한값이다.
+    attempts_reported: int = field(default=0, kw_only=True)
 
 
 def command_version(command: str) -> str | None:
@@ -135,6 +145,43 @@ def _codex_session_id(stdout: str) -> str | None:
     return None
 
 
+def _codex_usage(stdout: str) -> dict[str, int] | None:
+    """`codex exec --json`이 `turn.completed`에 실어 보내는 실측 사용량을 모은다.
+
+    codex-cli 0.145.0에서 첫 호출과 `exec resume` 모두 같은 이벤트를 낸다.
+    이벤트가 없으면 추정하지 않고 None을 돌려준다.
+    """
+    totals = dict.fromkeys(USAGE_FIELDS, 0)
+    reported = False
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "turn.completed":
+            continue
+        usage = event.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        reported = True
+        for key in totals:
+            value = usage.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                totals[key] += value
+    return totals if reported else None
+
+
+def _sum_usages(usages: list[dict[str, int]]) -> dict[str, int] | None:
+    """보고된 시도들의 사용량 합. 실패한 시도의 토큰도 여기에 포함된다."""
+    if not usages:
+        return None
+    totals = dict.fromkeys(USAGE_FIELDS, 0)
+    for usage in usages:
+        for key in totals:
+            totals[key] += int(usage.get(key, 0))
+    return totals
+
+
 def run_codex(
     *,
     bundle_dir: Path,
@@ -158,6 +205,7 @@ def run_codex(
     last_error: dict[str, Any] | None = None
     last_schema_error: SchemaError | None = None
     attempt_errors: list[dict[str, Any]] = []
+    attempt_usages: list[dict[str, int]] = []
     active_session_id = session_id
     for attempt in range(1, retries + 2):
         with tempfile.NamedTemporaryFile(prefix="ensemble-codex-", suffix=".json", delete=False) as handle:
@@ -200,7 +248,9 @@ def run_codex(
                     "read-only",
                     "--output-schema",
                     str(schema_path),
-                    *(["--json"] if persist_session else []),
+                    # 응답은 --output-last-message로 받으므로 --json을 켜도
+                    # 파싱 경로는 그대로다. 사용량 이벤트만 추가로 얻는다.
+                    "--json",
                     "--output-last-message",
                     str(output_path),
                     "-",
@@ -223,6 +273,11 @@ def run_codex(
                 last_error = {"attempt": attempt, "kind": "os", "message": str(exc)}
                 attempt_errors.append(last_error)
                 continue
+            # 스키마 오류 등으로 재시도해도 이미 소모한 토큰은 사라지지 않으므로
+            # 검증 전에 시도별 사용량을 먼저 모은다.
+            attempt_usage = _codex_usage(completed.stdout)
+            if attempt_usage is not None:
+                attempt_usages.append(attempt_usage)
             if completed.returncode != 0:
                 last_error = {
                     "attempt": attempt,
@@ -273,6 +328,8 @@ def run_codex(
                 reasoning_effort=effort,
                 session_id=active_session_id,
                 session_resumed=resuming,
+                usage=_sum_usages(attempt_usages),
+                attempts_reported=len(attempt_usages),
             )
         finally:
             output_path.unlink(missing_ok=True)
@@ -397,6 +454,10 @@ def run_agy(
             model,
             tuple(attempt_errors),
             reasoning_effort=effort,
+            # agy 1.1.5에는 사용량을 보고하는 플래그가 없다. 추정하지 않고
+            # 미보고로 남긴다.
+            usage=None,
+            attempts_reported=0,
         )
     if last_error and last_error.get("kind") == "schema":
         raise SchemaError(

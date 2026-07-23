@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "testable_criteria",
+    "internal_consistency",
+    "requirement_coverage",
+    "over_specification",
+    "overall"
+  ],
+  "properties": {
+    "testable_criteria": {"$ref": "#/$defs/axis"},
+    "internal_consistency": {"$ref": "#/$defs/axis"},
+    "requirement_coverage": {"$ref": "#/$defs/axis"},
+    "over_specification": {"$ref": "#/$defs/axis"},
+    "overall": {"$ref": "#/$defs/axis"}
+  },
+  "$defs": {
+    "axis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["winner", "reason"],
+      "properties": {
+        "winner": {"enum": ["DOC1", "DOC2", "TIE"]},
+        "reason": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}

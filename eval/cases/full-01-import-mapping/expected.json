@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "review_required": "이 정답지는 사용자가 검토해야 채점에 사용할 수 있습니다.",
+  "reviewed_by_user": false,
+  "case_type": "quality",
+  "suites": ["full"],
+  "tags": ["happy-path", "error-flow", "scope-creep"],
+  "difficulty": "medium",
+  "expected_terminal_states": ["CONVERGED"],
+  "forbidden_states": ["ITERATION_LIMIT_REACHED", "OSCILLATING", "PROTOTYPE_INCOMPLETE"],
+  "expect_user_decision": false,
+  "expect_escalation": false,
+  "quality_expectations": {
+    "must_cover": [
+      "필수 필드(상품코드, 수량, 창고)가 짝지어지지 않았을 때 가져오기를 시작하지 못하게 막는 조건",
+      "이미 존재하는 상품코드를 만났을 때 수량을 덮어쓰는 규칙",
+      "가져오기 완료 후 처리한 줄 수와 실패한 줄 수를 보여주는 결과 화면",
+      "실패한 줄을 사유와 함께 CSV로 내려받는 흐름",
+      "10MB를 넘는 파일을 올렸을 때의 실패 처리"
+    ],
+    "must_not_assert": [
+      "지원하는 CSV 문자 인코딩",
+      "가져오기를 취소하거나 되돌리는 기능",
+      "가져오기 이력을 저장하고 조회하는 기능",
+      "가져오기를 실행할 수 있는 사용자 권한 등급",
+      "백그라운드 작업 큐나 비동기 처리 방식"
+    ]
+  }
+}

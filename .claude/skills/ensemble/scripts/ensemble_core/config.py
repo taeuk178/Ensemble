@@ -8,6 +8,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[5]
 SKILL_ROOT = PROJECT_ROOT / ".claude" / "skills" / "ensemble"
 REFERENCE_ROOT = SKILL_ROOT / "references"
 RUNS_ROOT = PROJECT_ROOT / "ensemble" / "runs"
+EVAL_ROOT = PROJECT_ROOT / "eval"
+EVAL_CASES_ROOT = EVAL_ROOT / "cases"
+EVAL_RESULTS_ROOT = EVAL_ROOT / "results"
 
 DEFAULT_REVIEW_MODEL = os.environ.get("CODEX_REVIEW_MODEL", "gpt-5.6-sol")
 DEFAULT_PANEL_MODEL = os.environ.get("ANTIGRAVITY_PANEL_MODEL", "gemini-3.6-flash-high")
@@ -69,6 +72,29 @@ AUDIT_BUNDLE_ALLOWLIST = {
     "previous-draft.md",
     "new-issues.json",
 }
+
+# codex-cli 0.145.0의 `turn.completed` 이벤트가 보고하는 사용량 필드.
+# 지금 안 쓰는 값이라도 버리면 과거 실행에서 복구할 수 없으므로 모두 남긴다.
+USAGE_FIELDS = (
+    "input_tokens",
+    "cached_input_tokens",
+    "cache_write_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+)
+
+# 심판 입력에는 어느 쪽이 최종본인지 알려 줄 파일을 넣지 않는다.
+JUDGE_BUNDLE_ALLOWLIST = {"request.md", "rubric.md", "document-1.md", "document-2.md"}
+JUDGE_EXPECTATIONS_BUNDLE_ALLOWLIST = {"request.md", "rubric.md", "document.md", "expectations.json"}
+
+# 비교 채점 축. 점수 척도 대신 축별 승자만 고른다.
+JUDGE_AXES = (
+    "testable_criteria",
+    "internal_consistency",
+    "requirement_coverage",
+    "over_specification",
+    "overall",
+)
 
 FORBIDDEN_REVIEW_FILES = {
     "issue-registry.json",

@@ -19,10 +19,18 @@ from ensemble_core.config import (
 from ensemble_core.audit import apply_audit, run_issue_audit
 from ensemble_core.convergence import refresh_author_dispositions, reproducibility_metrics
 from ensemble_core.errors import EnsembleError, InfraError, InputError, SchemaError
+from ensemble_core.eval_bench import (
+    collect,
+    compare_scorecards,
+    plan,
+    validate_benchmark_block,
+    write_scorecard,
+)
+from ensemble_core.eval_process import compare_runs, evaluate_run
+from ensemble_core.eval_quality import run_quality_eval
 from ensemble_core.history import write_timeline
 from ensemble_core import layout
 from ensemble_core.io_utils import (
-    detect_sensitive_text,
     parse_answer_section,
     read_json,
     resolve_run,
@@ -54,6 +62,10 @@ from ensemble_core.workflow import (
     save_proposal,
 )
 
+
+# 평가 명령은 실행 상태를 바꾸지 않는다. 실행 산출물을 쓰지 않고, 평가 중
+# 오류가 나도 대상 실행을 INFRA_ERROR 등으로 종료 처리하지 않는다.
+EVAL_COMMANDS = {"eval-run", "eval-quality", "eval-bench", "eval-compare"}
 
 EXIT_CODES = {
     "INPUT_ERROR": 2,
@@ -116,12 +128,7 @@ def command_init(args: argparse.Namespace) -> dict[str, Any]:
         request = sys.stdin.read()
     else:
         request = positional
-    sensitive = detect_sensitive_text(request)
-    if sensitive and not args.allow_sensitive:
-        raise InputError(
-            "외부 모델에 보내면 안 될 수 있는 민감정보 패턴이 감지됐습니다.",
-            details={"patterns": sensitive, "override": "--allow-sensitive"},
-        )
+    benchmark = validate_benchmark_block(load_payload(args.benchmark_file)) if args.benchmark_file else None
     run_dir = initialize_run(
         request,
         phase=args.phase,
@@ -131,6 +138,10 @@ def command_init(args: argparse.Namespace) -> dict[str, Any]:
         max_rounds=args.max_rounds,
         max_panel_calls=args.max_panel_calls,
         allow_reuse=args.allow_reuse,
+        allow_sensitive=args.allow_sensitive,
+        label=args.label,
+        author_model=args.author_model,
+        benchmark=benchmark,
     )
     manifest = read_json(layout.manifest(run_dir))
     environment = manifest.get("environment", {})
@@ -446,6 +457,46 @@ def command_issue_audit(args: argparse.Namespace) -> dict[str, Any]:
     return applied
 
 
+def command_eval_run(args: argparse.Namespace) -> dict[str, Any]:
+    run_dir = resolve_run(args.run)
+    if args.compare:
+        return compare_runs([run_dir, *(resolve_run(value) for value in args.compare)])
+    return evaluate_run(run_dir)
+
+
+def command_eval_quality(args: argparse.Namespace) -> dict[str, Any]:
+    run_dir = resolve_run(args.run)
+    return run_quality_eval(
+        run_dir,
+        model=args.model or DEFAULT_PANEL_MODEL,
+        effort=args.effort or DEFAULT_PANEL_EFFORT,
+        timeout=args.timeout,
+        repetitions=args.repetitions,
+    )
+
+
+def command_eval_bench(args: argparse.Namespace) -> dict[str, Any]:
+    if not args.collect:
+        return plan(args.suite, case_id=args.case)
+    if not args.benchmark_run_id:
+        raise InputError("--collect에는 --benchmark-run-id가 필요합니다.")
+    scorecard = collect(
+        suite=args.suite,
+        benchmark_run_id=args.benchmark_run_id,
+        case_id=args.case,
+        judge_model=args.judge_model or DEFAULT_PANEL_MODEL,
+        judge_effort=args.judge_effort or DEFAULT_PANEL_EFFORT,
+        timeout=args.timeout,
+        skip_expectation_judge=args.skip_expectation_judge,
+    )
+    path = write_scorecard(scorecard)
+    return {"scorecard": str(path), **scorecard}
+
+
+def command_eval_compare(args: argparse.Namespace) -> dict[str, Any]:
+    return compare_scorecards(args.base, args.head, allow_model_mismatch=args.allow_model_mismatch)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Claude와 GPT로 구현 명세를 만들고 검토합니다.")
     subparsers = parser.add_subparsers(title="명령", dest="command", required=True)
@@ -467,6 +518,9 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--max-panel-calls", type=int, default=DEFAULT_MAX_PANEL_CALLS)
     init.add_argument("--allow-reuse", action="store_true")
     init.add_argument("--allow-sensitive", action="store_true")
+    init.add_argument("--label", help="사람이 읽는 표식. 실행 식별에는 쓰지 않습니다.")
+    init.add_argument("--author-model", help="작성자 모델 선언값. CLI가 검증하지 않습니다.")
+    init.add_argument("--benchmark-file", help="벤치마크 실행 식별 블록이 담긴 JSON 파일")
     init.set_defaults(func=command_init)
 
     check = subparsers.add_parser("preflight", help="실행 환경 확인")
@@ -585,6 +639,38 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--model")
     audit.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS)
     audit.set_defaults(func=command_issue_audit)
+
+    eval_run = subparsers.add_parser("eval-run", help="완료된 실행의 프로세스 지표 계산 (1층, 비용 없음)")
+    eval_run.add_argument("--run", required=True)
+    eval_run.add_argument("--compare", nargs="+", metavar="RUN")
+    eval_run.set_defaults(func=command_eval_run)
+
+    eval_quality = subparsers.add_parser(
+        "eval-quality", help="첫 초안과 마지막 초안을 심판이 블라인드 비교 (2층)"
+    )
+    eval_quality.add_argument("--run", required=True)
+    eval_quality.add_argument("--repetitions", type=int, default=1)
+    eval_quality.add_argument("--model")
+    eval_quality.add_argument("--effort", choices=["low", "medium", "high"])
+    eval_quality.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS)
+    eval_quality.set_defaults(func=command_eval_quality)
+
+    eval_bench = subparsers.add_parser("eval-bench", help="고정 케이스 세트로 코드 버전 평가 (3층)")
+    eval_bench.add_argument("--suite", choices=["smoke", "full"], required=True)
+    eval_bench.add_argument("--case")
+    eval_bench.add_argument("--collect", action="store_true")
+    eval_bench.add_argument("--benchmark-run-id")
+    eval_bench.add_argument("--judge-model")
+    eval_bench.add_argument("--judge-effort", choices=["low", "medium", "high"])
+    eval_bench.add_argument("--skip-expectation-judge", action="store_true")
+    eval_bench.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS)
+    eval_bench.set_defaults(func=command_eval_bench)
+
+    eval_compare = subparsers.add_parser("eval-compare", help="두 커밋의 점수표 비교")
+    eval_compare.add_argument("--base", required=True)
+    eval_compare.add_argument("--head", required=True)
+    eval_compare.add_argument("--allow-model-mismatch", action="store_true")
+    eval_compare.set_defaults(func=command_eval_compare)
     return parser
 
 
@@ -596,13 +682,13 @@ def main() -> int:
         run_value = getattr(args, "run", None)
         if args.command == "init":
             write_timeline(Path(result["run_dir"]))
-        elif run_value and args.command not in {"status", "timeline", "fixture-metrics"}:
+        elif run_value and args.command not in {"status", "timeline", "fixture-metrics"} | EVAL_COMMANDS:
             write_timeline(resolve_run(run_value))
         emit(result)
         return 0
     except EnsembleError as exc:
         run_value = getattr(args, "run", None)
-        if run_value:
+        if run_value and args.command not in EVAL_COMMANDS:
             try:
                 run_dir = resolve_run(run_value)
                 manifest = read_json(layout.manifest(run_dir))

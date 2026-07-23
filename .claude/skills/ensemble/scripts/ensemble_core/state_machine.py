@@ -15,6 +15,7 @@ from .config import (
     RUNS_ROOT,
     PAUSED_STATES,
     TERMINAL_STATES,
+    USAGE_FIELDS,
 )
 from .environment import ensemble_source_hash, environment_snapshot
 from .errors import InputError, StateError
@@ -23,6 +24,7 @@ from . import layout
 from .io_utils import (
     atomic_write_json,
     atomic_write_text,
+    detect_sensitive_text,
     find_consumed_request_hash,
     make_run_id,
     read_json,
@@ -96,9 +98,21 @@ def initialize_run(
     max_rounds: int = DEFAULT_MAX_ROUNDS,
     max_panel_calls: int = DEFAULT_MAX_PANEL_CALLS,
     allow_reuse: bool = False,
+    allow_sensitive: bool = False,
+    label: str | None = None,
+    author_model: str | None = None,
+    benchmark: dict[str, Any] | None = None,
 ) -> Path:
     if not request.strip():
         raise InputError("요청 내용이 비어 있습니다.")
+    # 비밀정보 차단은 실행이 만들어지기 전에 일어나야 하므로 여기서 본다.
+    # 3층 `init_block` 케이스가 검증하는 지점도 이 검사다.
+    sensitive = detect_sensitive_text(request)
+    if sensitive and not allow_sensitive:
+        raise InputError(
+            "외부 모델에 보내면 안 될 수 있는 민감정보 패턴이 감지됐습니다.",
+            details={"patterns": sensitive, "override": "--allow-sensitive"},
+        )
     request_hash = sha256_text(request)
     reused = find_consumed_request_hash(request_hash)
     if reused and not allow_reuse:
@@ -131,6 +145,12 @@ def initialize_run(
         "layout_version": layout.LAYOUT_VERSION,
         "run_id": run_id,
         "phase": phase,
+        # 사람이 읽는 표식. 실행 식별에는 쓰지 않는다(아래 benchmark 참조).
+        "label": (label or "").strip() or None,
+        # 벤치마크 실행을 케이스에 잇는 계약. runner는 label이 아니라
+        # 이 블록(benchmark_run_id, case_id, case_revision_hash 등)으로
+        # 실행을 수집한다.
+        "benchmark": benchmark,
         "state": "INITIALIZED",
         "current_round": 0,
         "request_hash": request_hash,
@@ -152,6 +172,9 @@ def initialize_run(
                 "requested_reasoning_effort": panel_effort,
                 "reasoning_effort": None,
             },
+            # 작성자(Claude) 런타임은 CLI가 감지할 수 없어 호출자가 알려준
+            # 값만 기록한다. 점수 비교 시 모델 구성이 같은지 확인하는 용도다.
+            "author": {"requested": (author_model or "").strip() or None},
         },
         "limits": {"review_rounds": max_rounds, "panel_calls": max_panel_calls},
         "retries": {"schema": 0, "semantic": 0, "infra": 0},
@@ -288,6 +311,52 @@ def assert_source_unchanged(run_dir: Path) -> None:
     )
 
 
+def empty_usage_totals() -> dict[str, int]:
+    """제공자 하나의 사용량 집계 초기값."""
+    totals = dict.fromkeys(USAGE_FIELDS, 0)
+    totals.update(
+        {
+            "calls_reported": 0,
+            "calls_unreported": 0,
+            "attempts_reported": 0,
+            "attempts_unreported": 0,
+        }
+    )
+    return totals
+
+
+def accumulate_usage(
+    manifest: dict[str, Any],
+    provider: str,
+    usage: Any,
+    *,
+    attempts: int = 1,
+    attempts_reported: int = 0,
+) -> None:
+    """제공자별 토큰 합계를 갱신한다.
+
+    `calls_*`는 논리 호출(run_codex/run_agy 1회) 수, `attempts_*`는 그 안의
+    재시도 1회 단위다. 사용량을 전혀 보고하지 않은 논리 호출은
+    `calls_unreported`로만 센다. 일부 시도만 보고된 호출은 `calls_reported`로
+    세면서 `attempts_unreported`가 올라가므로, 두 카운터 중 하나라도 0이
+    아니면 토큰 합계는 하한값이다.
+    """
+    totals = manifest.setdefault("usage", {}).setdefault(provider, empty_usage_totals())
+    for key, value in empty_usage_totals().items():
+        totals.setdefault(key, value)
+    attempts = max(int(attempts or 1), 1)
+    attempts_reported = max(min(int(attempts_reported or 0), attempts), 0)
+    totals["attempts_reported"] += attempts_reported
+    totals["attempts_unreported"] += attempts - attempts_reported
+    if not isinstance(usage, dict):
+        totals["calls_unreported"] += 1
+        return
+    for key in USAGE_FIELDS:
+        value = usage.get(key)
+        totals[key] += int(value) if isinstance(value, int) and not isinstance(value, bool) else 0
+    totals["calls_reported"] += 1
+
+
 def record_provider_call(
     run_dir: Path,
     *,
@@ -319,10 +388,19 @@ def record_provider_call(
         "outcome": outcome,
         "session_id": getattr(result, "session_id", None),
         "session_resumed": bool(getattr(result, "session_resumed", False)),
+        "usage": getattr(result, "usage", None),
+        "attempts_reported": int(getattr(result, "attempts_reported", 0) or 0),
     }
     if error:
         event["error"] = error
     manifest.setdefault("provider_calls", []).append(event)
+    accumulate_usage(
+        manifest,
+        provider,
+        event["usage"],
+        attempts=int(result.attempts),
+        attempts_reported=int(getattr(result, "attempts_reported", 0) or 0),
+    )
     for attempt_error in result.attempt_errors:
         kind = "schema" if attempt_error.get("kind") == "schema" else "infra"
         manifest.setdefault("retries", {}).setdefault(kind, 0)
@@ -386,7 +464,19 @@ def record_provider_failure(
             "attempt_errors": details.get("attempt_errors", []),
             "outcome": "FAILED",
             "error": error,
+            "usage": None,
+            "attempts_reported": 0,
         }
+    )
+    # 실패한 논리 호출이 소모한 토큰은 예외 경로에서 회수할 수 없다.
+    # 미보고로만 세어 집계가 하한값임을 드러낸다.
+    attempts = details.get("attempts")
+    accumulate_usage(
+        manifest,
+        provider,
+        None,
+        attempts=int(attempts) if isinstance(attempts, int) else 1,
+        attempts_reported=0,
     )
     atomic_write_json(layout.manifest(run_dir), manifest)
 
