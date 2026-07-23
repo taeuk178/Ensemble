@@ -635,6 +635,18 @@ class GradingTests(unittest.TestCase):
         )
         self.assertEqual(result["verdict"], "FAIL")
 
+    def test_missing_findings_do_not_hide_a_failed_state_check(self) -> None:
+        quality = case(
+            case_type="quality",
+            quality_expectations={"must_cover": ["오류 흐름"], "must_not_assert": []},
+        )
+        # 심판을 부르지 못했더라도 상태 검사가 이미 실패했으면 FAIL이다.
+        failed = grade_case(quality, observation(terminal_state="ITERATION_LIMIT_REACHED"), None)
+        self.assertEqual(failed["verdict"], "FAIL")
+        # 상태 검사가 통과했는데 품질 축만 모르면 판정을 보류한다.
+        unknown = grade_case(quality, observation(), None)
+        self.assertEqual(unknown["verdict"], "SKIP")
+
     def test_quality_case_passes_with_clean_findings(self) -> None:
         quality = case(
             case_type="quality",

@@ -305,7 +305,12 @@ def grade_case(
 
     if expected["case_type"] == "quality":
         if quality_findings is None:
-            return {"verdict": "SKIP", "reasons": [*reasons, "정답지 채점 결과가 없습니다."]}
+            # 상태 검사가 이미 실패했으면 품질 축을 몰라도 판정은 FAIL이다.
+            # SKIP으로 빼면 확인된 실패가 합계에서 사라진다.
+            if reasons:
+                reasons.append("정답지 채점 결과가 없어 품질 축은 평가하지 못했습니다.")
+                return {"verdict": "FAIL", "reasons": reasons}
+            return {"verdict": "SKIP", "reasons": ["정답지 채점 결과가 없습니다."]}
         missing = quality_findings.get("must_cover_missing") or []
         violations = quality_findings.get("must_not_assert_violations") or []
         if missing:
