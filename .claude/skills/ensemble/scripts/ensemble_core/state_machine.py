@@ -14,7 +14,9 @@ from .config import (
     DEFAULT_PANEL_MODEL,
     DEFAULT_REVIEW_EFFORT,
     DEFAULT_REVIEW_MODEL,
+    DEFAULT_REVIEW_SESSION_MAX_ROUNDS,
     RUNS_ROOT,
+    OPEN_STATUSES,
     PAUSED_STATES,
     TERMINAL_STATES,
     USAGE_FIELDS,
@@ -153,6 +155,9 @@ def initialize_run(
         {"schema_version": 1, "decisions": []},
         overwrite=False,
     )
+    user_decisions_hash = sha256_text(
+        layout.user_decisions(run_dir).read_text(encoding="utf-8")
+    )
     atomic_write_json(layout.registry(run_dir), {}, overwrite=False)
     atomic_write_json(layout.reviewer_index(run_dir), [], overwrite=False)
     atomic_write_json(layout.convergence(run_dir), {"rounds": [], "events": []}, overwrite=False)
@@ -180,6 +185,7 @@ def initialize_run(
         ],
         "current_round": 0,
         "request_hash": request_hash,
+        "user_decisions_hash": user_decisions_hash,
         "started_at": utc_now(),
         "finished_at": None,
         "termination_reason": None,
@@ -224,6 +230,7 @@ def initialize_run(
         "codex_review_session": None,
         "review_session_policy": {
             "reset_after_final_promotion": bool(reset_review_session_after_promotion),
+            "max_rounds_per_session": DEFAULT_REVIEW_SESSION_MAX_ROUNDS,
             "epoch": 0,
             "reset_count": 0,
         },
@@ -232,6 +239,7 @@ def initialize_run(
         "user_decisions": [],
         "pending_user_issue_ids": [],
         "pending_panel_issue_ids": [],
+        "repair_plan_required_issue_ids": [],
         "escalation_signals": [],
     }
     atomic_write_json(layout.manifest(run_dir), manifest, overwrite=False)
@@ -411,6 +419,65 @@ def assert_final_blind_budget(run_dir: Path) -> dict[str, Any]:
     return manifest
 
 
+def assert_final_blind_ready(run_dir: Path) -> dict[str, Any]:
+    """현재 초안이 일반 검토를 통과했고 아직 독립 검토되지 않았는지 확인한다."""
+    manifest = read_json(layout.manifest(run_dir))
+    current_round = int(manifest.get("current_round", 0))
+    if (
+        manifest.get("state") != "APPROVED"
+        or manifest.get("last_review_verdict") != "APPROVED"
+        or int(manifest.get("last_reviewed_draft_round", -1)) != current_round
+    ):
+        raise StateError(
+            "마지막 새 검토는 현재 초안이 일반 검토를 통과한 뒤에만 실행할 수 있습니다.",
+            details={
+                "state": manifest.get("state"),
+                "current_draft_round": current_round,
+                "last_reviewed_draft_round": manifest.get("last_reviewed_draft_round"),
+                "last_review_verdict": manifest.get("last_review_verdict"),
+            },
+        )
+    registry = read_json(layout.registry(run_dir), default={})
+    open_gating = sorted(
+        issue_id
+        for issue_id, issue in registry.items()
+        if isinstance(issue, dict)
+        and issue.get("status") in OPEN_STATUSES
+        and issue.get("gating", True)
+    )
+    if open_gating:
+        raise StateError(
+            "해결되지 않은 문제가 있어 마지막 새 검토를 실행할 수 없습니다.",
+            details={"open_issue_ids": open_gating},
+        )
+    prior = layout.iter_blind_attempts(run_dir, current_round)
+    if prior:
+        raise StateError(
+            "같은 초안에는 마지막 새 검토를 한 번만 실행할 수 있습니다. "
+            "발견한 문제를 반영하고 일반 검토를 다시 통과시켜 주세요.",
+            details={
+                "draft_round": current_round,
+                "previous_attempts": [path.name for path in prior],
+                "next_command": "promote-final",
+            },
+        )
+    return manifest
+
+
+def assert_accept_risk_ready(run_dir: Path, issue_id: str) -> dict[str, Any]:
+    manifest = read_json(layout.manifest(run_dir))
+    pending = set(str(value) for value in manifest.get("pending_user_issue_ids", []))
+    if manifest.get("state") != "USER_DECISION_REQUIRED" or issue_id not in pending:
+        raise StateError(
+            "위험 수용은 사용자 결정이 필요한 상태에서 제시된 이슈에만 기록할 수 있습니다.",
+            details={
+                "state": manifest.get("state"),
+                "pending_user_issue_ids": sorted(pending),
+            },
+        )
+    return manifest
+
+
 def assert_provider_call_budget(run_dir: Path, *, needed: int = 1) -> dict[str, Any]:
     manifest = read_json(layout.manifest(run_dir))
     limit = int(
@@ -450,14 +517,38 @@ def record_promotion(run_dir: Path) -> None:
     counters["sequence_round"] = int(manifest.get("last_review_round", 0) or 0)
     policy = manifest.setdefault(
         "review_session_policy",
-        {"reset_after_final_promotion": True, "epoch": 0, "reset_count": 0},
+        {
+            "reset_after_final_promotion": True,
+            "max_rounds_per_session": DEFAULT_REVIEW_SESSION_MAX_ROUNDS,
+            "epoch": 0,
+            "reset_count": 0,
+        },
     )
     if policy.get("reset_after_final_promotion", True):
-        manifest["codex_review_session"] = None
-        policy["epoch"] = int(policy.get("epoch", 0) or 0) + 1
-        policy["reset_count"] = int(policy.get("reset_count", 0) or 0) + 1
-        policy["last_reset_reason"] = "FINAL_BLIND_PROMOTION"
-        policy["last_reset_at"] = utc_now()
+        _reset_review_session_in_manifest(manifest, reason="FINAL_BLIND_PROMOTION")
+    atomic_write_json(layout.manifest(run_dir), manifest)
+
+
+def _reset_review_session_in_manifest(manifest: dict[str, Any], *, reason: str) -> None:
+    policy = manifest.setdefault(
+        "review_session_policy",
+        {
+            "reset_after_final_promotion": True,
+            "max_rounds_per_session": DEFAULT_REVIEW_SESSION_MAX_ROUNDS,
+            "epoch": 0,
+            "reset_count": 0,
+        },
+    )
+    manifest["codex_review_session"] = None
+    policy["epoch"] = int(policy.get("epoch", 0) or 0) + 1
+    policy["reset_count"] = int(policy.get("reset_count", 0) or 0) + 1
+    policy["last_reset_reason"] = reason
+    policy["last_reset_at"] = utc_now()
+
+
+def reset_codex_review_session(run_dir: Path, *, reason: str) -> None:
+    manifest = read_json(layout.manifest(run_dir))
+    _reset_review_session_in_manifest(manifest, reason=reason)
     atomic_write_json(layout.manifest(run_dir), manifest)
 
 
@@ -739,6 +830,9 @@ def resolve_user_decision(
         run_dir,
         authoritative_decisions or [],
     )
+    manifest["user_decisions_hash"] = sha256_text(
+        layout.user_decisions(run_dir).read_text(encoding="utf-8")
+    )
     event = {
         "recorded_at": utc_now(),
         "from_state": from_state,
@@ -776,6 +870,18 @@ def add_manifest_warning(run_dir: Path, warning: str) -> None:
 
 def register_draft(run_dir: Path, source: Path, round_number: int) -> dict[str, Any]:
     assert_run_can_advance(run_dir, "save draft")
+    manifest = read_json(layout.manifest(run_dir))
+    repair_required = sorted(
+        str(value) for value in (manifest.get("repair_plan_required_issue_ids") or [])
+    )
+    if repair_required:
+        raise StateError(
+            "같은 문제가 수정 후 다시 발견되어 근본 수정 계획이 필요합니다.",
+            details={
+                "issue_ids": repair_required,
+                "next_command": "repair-plan",
+            },
+        )
     if round_number < 0:
         raise InputError("초안 번호는 0 이상이어야 합니다.")
     destination = layout.draft(run_dir, round_number)
@@ -808,6 +914,63 @@ def register_draft(run_dir: Path, source: Path, round_number: int) -> dict[str, 
         "invalidated_accepted_risks": invalidated,
         "oscillation": oscillation,
     }
+
+
+def record_repair_plan(
+    run_dir: Path,
+    *,
+    issue_id: str,
+    round_number: int,
+    plan: dict[str, Any],
+) -> dict[str, Any]:
+    required_fields = {
+        "root_cause",
+        "invariant",
+        "counterexample",
+        "state_model",
+        "verification_steps",
+    }
+    if set(plan) != required_fields:
+        raise InputError(
+            "근본 수정 계획 필드가 올바르지 않습니다.",
+            details={
+                "missing": sorted(required_fields - set(plan)),
+                "unknown": sorted(set(plan) - required_fields),
+            },
+        )
+    for field in required_fields - {"verification_steps"}:
+        value = plan.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise InputError(f"근본 수정 계획의 {field}가 비어 있습니다.")
+    steps = plan.get("verification_steps")
+    if (
+        not isinstance(steps, list)
+        or not steps
+        or not all(isinstance(step, str) and step.strip() for step in steps)
+    ):
+        raise InputError("verification_steps는 비어 있지 않은 문자열 배열이어야 합니다.")
+    manifest = read_json(layout.manifest(run_dir))
+    pending = set(str(value) for value in manifest.get("repair_plan_required_issue_ids") or [])
+    if issue_id not in pending:
+        raise StateError(f"현재 근본 수정 계획이 필요한 이슈가 아닙니다: {issue_id}")
+    registry = read_json(layout.registry(run_dir), default={})
+    if issue_id not in registry:
+        raise InputError(f"존재하지 않는 이슈 ID입니다: {issue_id}")
+    record = {
+        "issue_id": issue_id,
+        "round": round_number,
+        "recorded_at": utc_now(),
+        **plan,
+    }
+    atomic_write_json(
+        layout.repair_plan(run_dir, issue_id, round_number),
+        record,
+        overwrite=False,
+    )
+    pending.remove(issue_id)
+    manifest["repair_plan_required_issue_ids"] = sorted(pending)
+    atomic_write_json(layout.manifest(run_dir), manifest)
+    return record
 
 
 def invalidate_accepted_risks(run_dir: Path, markdown: str, round_number: int) -> list[str]:

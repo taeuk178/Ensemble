@@ -26,12 +26,15 @@ from ensemble_core.providers import ProviderResult
 from ensemble_core.registry import accept_risk, load_registry, record_author_decision
 from ensemble_core.report import finalize
 from ensemble_core.state_machine import (
+    assert_accept_risk_ready,
+    assert_final_blind_ready,
     assert_run_can_advance,
     assert_final_blind_budget,
     assert_source_unchanged,
     initialize_run,
     load_codex_review_session,
     record_codex_review_session,
+    record_repair_plan,
     register_draft,
     resolve_user_decision,
     verified_request_hash,
@@ -40,7 +43,13 @@ from ensemble_core.validation import validate_review_schema
 from ensemble_core.workflow import ingest_review, promote_final_findings, run_review
 
 
-def issue(*, issue_id: str | None = None, severity: int = 4, response: str | None = None) -> dict[str, object]:
+def issue(
+    *,
+    issue_id: str | None = None,
+    severity: int = 4,
+    response: str | None = None,
+    decision_owner: str = "AUTHOR",
+) -> dict[str, object]:
     return {
         "id": issue_id,
         "criterion_id": "AC-02",
@@ -50,6 +59,7 @@ def issue(*, issue_id: str | None = None, severity: int = 4, response: str | Non
         "violation_evidence": "`오류 흐름` 절에 실패 상태가 없다.",
         "implementation_consequence": "구현자가 실패 상태를 임의로 결정해야 한다.",
         "required_change": "실패 상태와 복구 흐름을 추가한다.",
+        "decision_owner": decision_owner,
         "severity": severity,
         "confidence": 0.8,
         "basis": "DOCUMENT_INTERNAL",
@@ -65,6 +75,7 @@ def review(
     blockers: list[dict[str, object]] | None = None,
     resolved: list[dict[str, object]] | None = None,
     verdict: str | None = None,
+    questions: list[str] | None = None,
 ) -> dict[str, object]:
     blockers = blockers or []
     resolved = resolved or []
@@ -73,7 +84,7 @@ def review(
         "summary": "구조화 리뷰",
         "blocking_issues": blockers,
         "resolved_issues": resolved,
-        "questions_for_user": [],
+        "questions_for_user": questions or [],
         "nonblocking_risks": [],
     }
 
@@ -411,6 +422,96 @@ class RegistryAndWorkflowTests(RunCase):
         self.assertEqual(resolved["from_state"], "USER_DECISION_REQUIRED")
         self.assertEqual(assert_run_can_advance(self.run, "review")["state"], "DRAFT_READY")
 
+    def test_user_owned_issue_pauses_for_an_authoritative_decision(self) -> None:
+        result = ingest_review(
+            self.run,
+            review=review(
+                blockers=[issue(decision_owner="USER")],
+                verdict="USER_DECISION_REQUIRED",
+                questions=["예보 기반으로 제품 범위를 줄일까요?"],
+            ),
+            review_round=1,
+        )
+        issue_id = result["stats"]["new_issue_ids"][0]
+        manifest = read_json(layout.manifest(self.run))
+        self.assertEqual(manifest["state"], "USER_DECISION_REQUIRED")
+        self.assertEqual(manifest["pending_user_issue_ids"], [issue_id])
+        self.assertEqual(
+            assert_accept_risk_ready(self.run, issue_id)["state"],
+            "USER_DECISION_REQUIRED",
+        )
+
+    def test_user_owned_issue_cannot_be_returned_as_an_author_fix(self) -> None:
+        with self.assertRaises(SemanticValidationError):
+            ingest_review(
+                self.run,
+                review=review(blockers=[issue(decision_owner="USER")]),
+                review_round=1,
+            )
+
+    def test_repeated_failed_fix_requires_a_structural_repair_plan(self) -> None:
+        issue_id = self.first_issue()
+        workspace = layout.review_sessions_dir(self.run) / "failed-fix"
+        workspace.mkdir(parents=True)
+        record_codex_review_session(
+            self.run,
+            session_id="session-before-failed-fix",
+            review_round=1,
+            workspace=workspace,
+        )
+        for round_number in (1, 2):
+            record_author_decision(
+                self.run,
+                issue_id=issue_id,
+                round_number=round_number,
+                disposition="ACCEPT",
+                author_severity=4,
+                claim="수정 필요",
+                evidence_ref="오류 흐름",
+                requested_disposition="MODIFY",
+                argument="타당함",
+                action="수정",
+            )
+            refresh_author_dispositions(self.run, round_number)
+            if round_number == 1:
+                draft1 = self.root / "failed-fix-draft-1.md"
+                draft1.write_text(
+                    "# 스펙\n\n## 오류 흐름\n\n첫 번째 수정\n",
+                    encoding="utf-8",
+                )
+                register_draft(self.run, draft1, 1)
+                ingest_review(
+                    self.run,
+                    review=review(blockers=[issue(issue_id=issue_id)]),
+                    review_round=2,
+                )
+
+        manifest = read_json(layout.manifest(self.run))
+        self.assertEqual(manifest["repair_plan_required_issue_ids"], [issue_id])
+        self.assertIsNone(manifest["codex_review_session"])
+        blocked = self.root / "blocked-draft.md"
+        blocked.write_text("# 스펙\n\n## 오류 흐름\n\n두 번째 수정\n", encoding="utf-8")
+        with self.assertRaises(StateError):
+            register_draft(self.run, blocked, 2)
+
+        record_repair_plan(
+            self.run,
+            issue_id=issue_id,
+            round_number=2,
+            plan={
+                "root_cause": "실패 상태를 문장만 바꾸고 상태 모델에 넣지 않았다.",
+                "invariant": "모든 실패 상태에는 복구 전이가 하나 이상 있어야 한다.",
+                "counterexample": "저장 실패 뒤 재시도 경로가 없다.",
+                "state_model": "READY -> SAVING -> FAILED -> RETRYING",
+                "verification_steps": ["저장 실패를 주입한다.", "재시도 후 성공을 확인한다."],
+            },
+        )
+        self.assertEqual(
+            read_json(layout.manifest(self.run))["repair_plan_required_issue_ids"],
+            [],
+        )
+        register_draft(self.run, blocked, 2)
+
     def test_reviewer_storm_pauses_before_another_draft_or_review(self) -> None:
         previous_id = self.first_issue()
         record_author_decision(
@@ -570,6 +671,12 @@ class BundleAndReportTests(RunCase):
         self.assertEqual(models["agy"]["requested"], "gemini-3.6-flash-high")
         self.assertEqual(models["agy"]["requested_reasoning_effort"], "high")
 
+    def test_default_review_budgets_are_bounded(self) -> None:
+        manifest = read_json(layout.manifest(self.run))
+        self.assertEqual(manifest["limits"]["iterative_reviews"], 5)
+        self.assertEqual(manifest["limits"]["final_blind_attempts"], 2)
+        self.assertEqual(manifest["review_session_policy"]["max_rounds_per_session"], 3)
+
     def test_final_bundle_contains_only_blind_inputs(self) -> None:
         with isolated_bundle(
             self.run,
@@ -597,6 +704,22 @@ class BundleAndReportTests(RunCase):
         )
         self.assertNotIn("ensemble-status", layout.final(self.run).read_text(encoding="utf-8"))
 
+    def test_final_blind_requires_current_general_review_approval(self) -> None:
+        with self.assertRaises(StateError):
+            assert_final_blind_ready(self.run)
+        ingest_review(self.run, review=review(), review_round=1)
+        self.assertEqual(assert_final_blind_ready(self.run)["state"], "APPROVED")
+
+    def test_final_blind_cannot_repeat_on_the_same_draft(self) -> None:
+        ingest_review(self.run, review=review(), review_round=1)
+        save_final_assessment(
+            self.run,
+            draft_path=layout.draft(self.run, 0),
+            raw_review=review(),
+        )
+        with self.assertRaises(StateError):
+            assert_final_blind_ready(self.run)
+
     def test_authoritative_user_decisions_are_projected_for_reviewers(self) -> None:
         current = read_json(layout.manifest(self.run))
         current["state"] = "USER_DECISION_REQUIRED"
@@ -622,6 +745,27 @@ class BundleAndReportTests(RunCase):
                 "UD-001",
             )
 
+    def test_direct_user_decision_file_edit_is_rejected_before_review(self) -> None:
+        projection = read_json(layout.user_decisions(self.run))
+        projection["decisions"].append(
+            {
+                "decision_id": "UD-001",
+                "source": "USER",
+                "decision": "작성자가 직접 추가한 결정",
+                "supersedes": [],
+                "active": True,
+                "recorded_at": "2026-07-23T00:00:00Z",
+            }
+        )
+        atomic_write_json(layout.user_decisions(self.run), projection)
+        with self.assertRaises(StateError):
+            with isolated_bundle(
+                self.run,
+                mode="final",
+                draft_path=layout.draft(self.run, 0),
+            ):
+                pass
+
     def test_benchmark_run_cannot_resume_after_user_decision_state(self) -> None:
         current = read_json(layout.manifest(self.run))
         current["state"] = "USER_DECISION_REQUIRED"
@@ -638,7 +782,7 @@ class BundleAndReportTests(RunCase):
         self.assertTrue(raised.exception.details["benchmark_case_completed"])
 
     def test_final_blind_attempt_budget_is_independent(self) -> None:
-        for _ in range(3):
+        for _ in range(2):
             save_final_assessment(
                 self.run,
                 draft_path=layout.draft(self.run, 0),
@@ -1110,6 +1254,47 @@ class ReviewSessionTests(RunCase):
         manifest = read_json(layout.manifest(self.run))
         self.assertEqual(manifest["codex_review_session"]["last_review_round"], 2)
         self.assertEqual(manifest["codex_review_session"]["request_hash"], verified_request_hash(self.run))
+
+    def test_review_session_resets_after_three_rounds(self) -> None:
+        received_session_ids: list[str | None] = []
+        created_sessions = iter(("session-1", "session-2"))
+
+        def fake_codex(**kwargs: object) -> ProviderResult:
+            prior = kwargs.get("session_id")
+            prior_session_id = prior if isinstance(prior, str) else None
+            received_session_ids.append(prior_session_id)
+            session_id = prior_session_id or next(created_sessions)
+            return ProviderResult(
+                payload=review(),
+                stdout="",
+                stderr="",
+                attempts=1,
+                executable="/fake/codex",
+                version="codex-cli test",
+                model="test-model",
+                reasoning_effort="high",
+                session_id=session_id,
+                session_resumed=prior_session_id is not None,
+            )
+
+        with patch("ensemble_core.workflow.run_codex", side_effect=fake_codex):
+            for review_round in range(1, 5):
+                run_review(
+                    self.run,
+                    review_round=review_round,
+                    draft_round=0,
+                    model="test-model",
+                    timeout=30,
+                )
+
+        self.assertEqual(received_session_ids, [None, "session-1", "session-1", None])
+        manifest = read_json(layout.manifest(self.run))
+        self.assertEqual(manifest["codex_review_session"]["session_id"], "session-2")
+        self.assertEqual(manifest["review_session_policy"]["reset_count"], 1)
+        self.assertEqual(
+            manifest["review_session_policy"]["last_reset_reason"],
+            "PERIODIC_ROUND_LIMIT",
+        )
 
 
 class LayoutTests(RunCase):

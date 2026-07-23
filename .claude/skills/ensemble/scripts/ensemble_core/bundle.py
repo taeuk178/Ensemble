@@ -19,7 +19,7 @@ from .config import (
     REVIEW_BUNDLE_ALLOWLIST,
 )
 from .errors import SecurityError, StateError
-from .io_utils import atomic_write_json, ensure_within
+from .io_utils import atomic_write_json, ensure_within, read_json, sha256_text
 from . import layout
 
 
@@ -45,6 +45,14 @@ def _copy_user_decisions(run_dir: Path, destination: Path) -> None:
     """구버전 실행에는 projection이 없으므로 빈 권위 입력으로 읽는다."""
     source = layout.user_decisions(run_dir)
     if source.exists():
+        manifest = read_json(layout.manifest(run_dir), default={})
+        expected_hash = manifest.get("user_decisions_hash")
+        actual_hash = sha256_text(source.read_text(encoding="utf-8"))
+        if expected_hash and actual_hash != expected_hash:
+            raise StateError(
+                "user-decisions.json이 사용자 결정 명령 밖에서 변경되었습니다. "
+                "resolve-user-decision으로만 권위 결정을 기록해 주세요."
+            )
         _copy_checked(source, destination, run_dir)
         return
     destination.write_text(

@@ -20,6 +20,7 @@ ISSUE_FIELDS = {
     "violation_evidence",
     "implementation_consequence",
     "required_change",
+    "decision_owner",
     "severity",
     "confidence",
     "basis",
@@ -104,6 +105,8 @@ def _issue(issue: Any, context: str) -> None:
         raise SchemaError(f"{context}.confidence must be between 0 and 1")
     if issue["basis"] not in {"DOCUMENT_INTERNAL", "EXTERNAL_FACT", "ASSUMPTION"}:
         raise SchemaError(f"{context}.basis is invalid")
+    if issue["decision_owner"] not in {"AUTHOR", "USER"}:
+        raise SchemaError(f"{context}.decision_owner is invalid")
     if not isinstance(issue["verification_required"], bool):
         raise SchemaError(f"{context}.verification_required must be boolean")
     if issue["response_to_rebuttal"] is not None:
@@ -290,6 +293,15 @@ def validate_review_semantics(
         raise SemanticValidationError("NEEDS_REVISION requires at least one blocking issue")
     if payload["verdict"] == "USER_DECISION_REQUIRED" and not payload["questions_for_user"]:
         raise SemanticValidationError("USER_DECISION_REQUIRED requires a user question")
+    user_owned = [issue for issue in blocking if issue["decision_owner"] == "USER"]
+    if user_owned and payload["verdict"] != "USER_DECISION_REQUIRED":
+        raise SemanticValidationError(
+            "USER-owned blocking issues require USER_DECISION_REQUIRED"
+        )
+    if payload["verdict"] == "USER_DECISION_REQUIRED" and not user_owned:
+        raise SemanticValidationError(
+            "USER_DECISION_REQUIRED requires at least one USER-owned blocking issue"
+        )
 
     seen: set[str] = set()
     for issue in blocking:
@@ -314,6 +326,8 @@ def validate_review_semantics(
     for issue in risks:
         if issue["severity"] > 2:
             raise SemanticValidationError("nonblocking_risks may only contain severity 1-2")
+        if issue["decision_owner"] != "AUTHOR":
+            raise SemanticValidationError("nonblocking risks must be AUTHOR-owned")
         if issue["criterion_id"] not in allowed_criteria:
             raise SemanticValidationError(f"Unknown criterion_id: {issue['criterion_id']}")
 

@@ -24,6 +24,7 @@ from .state_machine import (
     record_codex_review_session,
     record_provider_call,
     record_retry_event,
+    reset_codex_review_session,
     verified_request_hash,
     transition_state,
 )
@@ -164,6 +165,15 @@ def _validate_and_apply_review(
     manifest["last_reviewed_draft_round"] = draft_round
     manifest["last_review_verdict"] = review["verdict"]
     transition_state(manifest, review["verdict"], reason=f"review {review_round} applied")
+    pending_user: set[str] = set()
+    for position, finding in enumerate(review["blocking_issues"]):
+        if finding.get("decision_owner") != "USER":
+            continue
+        issue_id = finding.get("id") or stats["assigned_ids"].get(str(position))
+        if issue_id:
+            pending_user.add(str(issue_id))
+    if review["verdict"] == "USER_DECISION_REQUIRED":
+        manifest["pending_user_issue_ids"] = sorted(pending_user)
     history = [
         item
         for item in manifest.get("review_history", [])
@@ -248,6 +258,13 @@ def run_review(
     last_error: SemanticValidationError | SchemaError | None = None
     request_hash = verified_request_hash(run_dir)
     review_session = load_codex_review_session(run_dir)
+    if review_session:
+        policy = manifest.get("review_session_policy") or {}
+        max_rounds = int(policy.get("max_rounds_per_session", 3) or 3)
+        first_round = int(review_session.get("first_review_round", review_round))
+        if review_round - first_round >= max_rounds:
+            reset_codex_review_session(run_dir, reason="PERIODIC_ROUND_LIMIT")
+            review_session = None
     session_id = review_session["session_id"] if review_session else None
     bundle_dir = prepare_review_session_bundle(
         run_dir,
@@ -345,12 +362,20 @@ def promote_final_findings(run_dir: Path) -> dict[str, Any]:
     draft_round, _ = current_draft(run_dir)
     review_round = int(manifest.get("last_review_round", 0)) + 1
     baseline_draft_round = int(manifest.get("last_reviewed_draft_round", -1))
+    user_owned = [
+        record["finding"]
+        for record in findings
+        if (record.get("finding") or {}).get("decision_owner") == "USER"
+    ]
     review = {
-        "verdict": "NEEDS_REVISION",
+        "verdict": "USER_DECISION_REQUIRED" if user_owned else "NEEDS_REVISION",
         "summary": "최종 독립 검토에서 새로운 미수용 이슈가 발견되어 일반 검토로 돌아갑니다.",
         "blocking_issues": [record["finding"] for record in findings],
         "resolved_issues": [],
-        "questions_for_user": [],
+        "questions_for_user": [
+            str(finding.get("required_change") or finding.get("problem"))
+            for finding in user_owned
+        ],
         "nonblocking_risks": [],
     }
     output_path = layout.promoted(run_dir, review_round)

@@ -13,6 +13,7 @@
         "violation_evidence",
         "implementation_consequence",
         "required_change",
+        "decision_owner",
         "severity",
         "confidence",
         "basis",
@@ -60,6 +61,12 @@
         "required_change": {
           "type": "string",
           "minLength": 1
+        },
+        "decision_owner": {
+          "enum": [
+            "AUTHOR",
+            "USER"
+          ]
         },
         "severity": {
           "type": "integer",

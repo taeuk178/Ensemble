@@ -28,6 +28,7 @@ RUN_SUBDIRS = (
     "04-reviews/reconciliation",
     "04-reviews/panel",
     "_state/hashes",
+    "_state/repair-plans",
     "_internal/bundles",
 )
 
@@ -186,6 +187,12 @@ def hashes_dir(run_dir: Path) -> Path:
 
 def iter_hashes(run_dir: Path) -> list[Path]:
     return _by_round(list(hashes_dir(run_dir).glob("draft-*.json")))
+
+
+def repair_plan(run_dir: Path, issue_id: str, round_number: int) -> Path:
+    if not re.fullmatch(r"R\d+-I\d+", issue_id):
+        raise ValueError(f"올바르지 않은 이슈 ID입니다: {issue_id}")
+    return run_dir / "_state" / "repair-plans" / f"{issue_id}-r{round_number:02d}.json"
 
 
 # --- 사람이 읽는 결과 -------------------------------------------------

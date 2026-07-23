@@ -58,7 +58,7 @@ python3 .claude/skills/ensemble/scripts/review.py finalize --run <run_dir> --sta
 
 검토 번호와 초안 번호는 별개입니다. 문서를 고치지 않았다면 새 초안을 만들지 않고 다음 검토 번호로 최신 초안을 다시 검토합니다. 특정 초안을 지정할 때만 `review --draft-round <N>`을 사용합니다.
 
-일반 검토는 같은 실행의 같은 요청 안에서 하나의 Codex 세션을 이어서 사용합니다. 1차 검토에서 세션을 만들고 다음 검토부터 이전 문답을 이어받습니다. 요청 원문이나 실행 ID가 다르면 세션 재사용을 거부합니다. 제안, 추가 판단, 이슈 점검, 최종 독립 검토는 기존처럼 새 세션에서 실행합니다.
+일반 검토는 같은 실행의 같은 요청 안에서 Codex 세션을 이어서 사용하되 한 세션은 최대 3회까지만 재사용합니다. 이후에는 현재 이슈 projection을 바탕으로 새 세션을 시작해 누적 문맥과 확증 편향을 줄입니다. 요청 원문이나 실행 ID가 다르면 세션 재사용을 거부합니다. 제안, 추가 판단, 이슈 점검, 최종 독립 검토는 새 세션에서 실행합니다.
 
 `USER_DECISION_REQUIRED` 또는 `ESCALATION_REQUIRED`가 나오면 작업이 멈추고 사용자 선택을 기다립니다. 선택과 새로 확정한 요구를 구조화 JSON으로 저장한 뒤 작업을 재개합니다.
 
@@ -67,7 +67,7 @@ python3 .claude/skills/ensemble/scripts/review.py resolve-user-decision \
   --run <run_dir> --decision-file <사용자-결정.json>
 ```
 
-결정 파일은 `action`, `audit_note`, `authoritative_decisions`를 담습니다. 각 권위 결정은 `decision`과 기존 결정을 대체할 때 쓰는 `supersedes` ID 배열을 가집니다. 문서를 고치지 않고 검토를 이어가려면 `action`을 `CONTINUE`로 둡니다. 감사 기록은 `decisions.md`, `manifest.json`, `timeline.md`에, 검토자가 읽는 권위 입력은 `01-input/user-decisions.json`에 남습니다.
+결정 파일은 `action`, `audit_note`, `authoritative_decisions`를 담습니다. 각 권위 결정은 `decision`과 기존 결정을 대체할 때 쓰는 `supersedes` ID 배열을 가집니다. 문서를 고치지 않고 검토를 이어가려면 `action`을 `CONTINUE`로 둡니다. 감사 기록은 `decisions.md`, `manifest.json`, `timeline.md`에, 검토자가 읽는 권위 입력은 `01-input/user-decisions.json`에 남습니다. `user-decisions.json`을 직접 수정하면 무결성 검사에서 거부됩니다.
 
 ## 용어
 
@@ -101,7 +101,9 @@ python3 .claude/skills/ensemble/scripts/review.py resolve-user-decision \
 
 - 일반 검토의 입력 묶음에는 전체 이슈 기록, 작성자 결정, 이전 점수를 넣지 않습니다.
 - 일반 검토 세션은 요청 해시와 실행 ID가 모두 같은 경우에만 이어서 사용합니다.
+- 기본 한도는 일반 검토 5회, 최종 독립 검토 2회입니다.
 - 최종 독립 검토에는 요청, 완료 기준, 권위 있는 사용자 결정, 최종 초안만 전달합니다.
+- 최종 독립 검토는 현재 초안이 일반 검토를 통과한 경우에만, 초안당 한 번 실행합니다.
 - `final.md`에는 상태 헤더나 리뷰 이력 부록을 붙이지 않습니다. 상태와 이견은 manifest·registry·timeline에서 확인합니다.
 - 검토 결과와 초안 사본은 덮어쓰지 않습니다.
 - 일반 검토·최종 독립 검토·전체 provider 호출 한도를 따로 적용하며, 한도 도달을 승인으로 처리하지 않습니다.

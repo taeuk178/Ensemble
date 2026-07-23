@@ -142,6 +142,9 @@ def write_reviewer_projection(run_dir: Path, registry: dict[str, Any] | None = N
                 "status": issue.get("status"),
                 "section_ref": issue.get("section_ref"),
                 "evidence_refs": issue.get("evidence_refs", []),
+                "decision_owner": (issue.get("latest_issue") or {}).get(
+                    "decision_owner", "AUTHOR"
+                ),
                 "author_claim": latest_author.get("claim"),
                 "author_evidence_ref": latest_author.get("evidence_ref"),
                 "author_requested_disposition": latest_author.get("requested_disposition"),

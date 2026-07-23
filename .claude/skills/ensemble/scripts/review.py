@@ -38,6 +38,7 @@ from ensemble_core.io_utils import (
     read_json,
     resolve_run,
     safe_source_file,
+    utc_now,
 )
 from ensemble_core.isolated import run_final_blind, save_final_assessment
 from ensemble_core.noise import measure_noise
@@ -47,7 +48,9 @@ from ensemble_core.registry import accept_risk, load_registry, record_author_dec
 from ensemble_core.report import finalize
 from ensemble_core.state_machine import (
     assert_run_can_advance,
+    assert_accept_risk_ready,
     assert_final_blind_budget,
+    assert_final_blind_ready,
     assert_iterative_review_budget,
     assert_provider_call_budget,
     assert_source_unchanged,
@@ -56,6 +59,7 @@ from ensemble_core.state_machine import (
     record_provider_call,
     record_provider_failure,
     record_retry_event,
+    record_repair_plan,
     resolve_user_decision,
     transition_state,
 )
@@ -322,11 +326,33 @@ def command_decision(args: argparse.Namespace) -> dict[str, Any]:
         from ensemble_core.io_utils import atomic_write_json
 
         atomic_write_json(layout.manifest(run_dir), manifest)
-    return {"recorded": payload["issue_id"], "disposition": payload["disposition"]}
+    manifest = read_json(layout.manifest(run_dir))
+    return {
+        "recorded": payload["issue_id"],
+        "disposition": payload["disposition"],
+        "repair_plan_required_issue_ids": manifest.get(
+            "repair_plan_required_issue_ids", []
+        ),
+    }
+
+
+def command_repair_plan(args: argparse.Namespace) -> dict[str, Any]:
+    run_dir = resolve_run(args.run)
+    assert_run_can_advance(run_dir, "repair-plan")
+    assert_source_unchanged(run_dir)
+    payload = load_payload(args.input)
+    return record_repair_plan(
+        run_dir,
+        issue_id=args.issue,
+        round_number=args.round,
+        plan=payload,
+    )
 
 
 def command_accept_risk(args: argparse.Namespace) -> dict[str, Any]:
     run_dir = resolve_run(args.run)
+    manifest = assert_accept_risk_ready(run_dir, args.issue)
+    pending = set(str(value) for value in manifest.get("pending_user_issue_ids", []))
     note = safe_source_file(args.note_file).read_text(encoding="utf-8").strip()
     if not note:
         raise InputError("Acceptance note cannot be empty")
@@ -336,10 +362,18 @@ def command_accept_risk(args: argparse.Namespace) -> dict[str, Any]:
         note=note,
         round_number=args.round,
     )
-    manifest = read_json(layout.manifest(run_dir))
-    pending = set(manifest.get("pending_user_issue_ids", []))
     pending.discard(args.issue)
     manifest["pending_user_issue_ids"] = sorted(pending)
+    manifest.setdefault("user_decisions", []).append(
+        {
+            "recorded_at": utc_now(),
+            "from_state": "USER_DECISION_REQUIRED",
+            "action": "ACCEPT_RISK",
+            "note": note,
+            "pending_issue_ids": [args.issue],
+            "authoritative_decision_ids": [],
+        }
+    )
     if not pending and manifest.get("state") == "USER_DECISION_REQUIRED":
         transition_state(manifest, "DRAFT_READY", reason="accepted risk resolved pending decision")
     from ensemble_core.io_utils import atomic_write_json
@@ -351,6 +385,7 @@ def command_accept_risk(args: argparse.Namespace) -> dict[str, Any]:
 def command_final_blind(args: argparse.Namespace) -> dict[str, Any]:
     run_dir = resolve_run(args.run)
     assert_run_can_advance(run_dir, "final-blind")
+    assert_final_blind_ready(run_dir)
     assert_source_unchanged(run_dir)
     enforce_run_budget(run_dir, assert_final_blind_budget)
     _, draft_path = current_draft(run_dir)
@@ -425,7 +460,11 @@ def command_status(args: argparse.Namespace) -> dict[str, Any]:
         "issue_set_stalled_rounds": [record["round"] for record in convergence["rounds"] if record.get("issue_set_stalled")],
         "warnings": manifest.get("warnings", []),
         "escalation_signals": manifest.get("escalation_signals", []),
+        "pending_user_issue_ids": manifest.get("pending_user_issue_ids", []),
         "pending_panel_issue_ids": manifest.get("pending_panel_issue_ids", []),
+        "repair_plan_required_issue_ids": manifest.get(
+            "repair_plan_required_issue_ids", []
+        ),
         "timeline": str(layout.timeline(run_dir)),
     }
 
@@ -655,6 +694,13 @@ def build_parser() -> argparse.ArgumentParser:
     decision.add_argument("--run", required=True)
     decision.add_argument("--input", required=True)
     decision.set_defaults(func=command_decision)
+
+    repair = subparsers.add_parser("repair-plan", help="반복 실패 이슈의 근본 수정 계획 기록")
+    repair.add_argument("--run", required=True)
+    repair.add_argument("--issue", required=True)
+    repair.add_argument("--round", type=int, required=True)
+    repair.add_argument("--input", required=True)
+    repair.set_defaults(func=command_repair_plan)
 
     risk = subparsers.add_parser("accept-risk", help="사용자가 수용한 위험 기록")
     risk.add_argument("--run", required=True)
