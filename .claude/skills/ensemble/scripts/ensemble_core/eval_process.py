@@ -16,6 +16,7 @@ from typing import Any
 
 from .environment import ensemble_source_hash, git_commit
 from .io_utils import atomic_write_json, atomic_write_text, read_json, utc_now
+from .state_machine import recompute_usage_from_provider_calls
 from . import layout
 
 
@@ -637,6 +638,11 @@ def evaluate_run(run_dir: Path, *, write: bool = True) -> dict[str, Any]:
         **manifest,
         "counters": {**(manifest.get("counters") or {})},
     }
+    recomputed_usage = recompute_usage_from_provider_calls(manifest)
+    usage_was_recomputed = bool(manifest.get("provider_calls")) and (
+        recomputed_usage != (manifest.get("usage") or {})
+    )
+    metric_manifest["usage"] = recomputed_usage
     counters = metric_manifest["counters"]
     # counters 도입 이전의 layout v2 실행도 파일 종류로 정확히 복원한다.
     counters.setdefault("iterative_reviews", len(layout.iter_reviews(run_dir)))
@@ -651,6 +657,10 @@ def evaluate_run(run_dir: Path, *, write: bool = True) -> dict[str, Any]:
     )
     if not convergence_path.exists():
         metrics["warnings"].insert(0, "convergence.json이 없습니다.")
+    if usage_was_recomputed:
+        metrics["warnings"].append(
+            "지속 Codex 세션의 누적 usage를 호출별 증가분으로 다시 계산했습니다."
+        )
 
     run_environment = manifest.get("environment") or {}
     evaluator_commit = git_commit()

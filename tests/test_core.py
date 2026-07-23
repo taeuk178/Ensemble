@@ -34,6 +34,7 @@ from ensemble_core.state_machine import (
     initialize_run,
     load_codex_review_session,
     record_codex_review_session,
+    record_provider_call,
     record_repair_plan,
     register_draft,
     resolve_user_decision,
@@ -1059,6 +1060,63 @@ class ProviderCommandTests(unittest.TestCase):
         self.assertEqual(raised.exception.details["usage"]["output_tokens"], 3)
         self.assertEqual(raised.exception.details["attempts_reported"], 2)
 
+    def test_failed_codex_call_folds_cumulative_usage_for_same_session(self) -> None:
+        from ensemble_core.providers import run_codex
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            schema = root / "schema.json"
+            schema.write_text(
+                json.dumps(
+                    {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["ok"],
+                        "properties": {"ok": {"type": "boolean"}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            attempt = 0
+
+            def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
+                nonlocal attempt
+                if "--version" in command:
+                    return SimpleNamespace(returncode=0, stdout="codex-cli test", stderr="")
+                attempt += 1
+                stdout = "\n".join(
+                    [
+                        json.dumps({"type": "thread.started", "thread_id": "session-1"}),
+                        json.dumps(
+                            {
+                                "type": "turn.completed",
+                                "usage": {
+                                    "input_tokens": attempt * 10,
+                                    "output_tokens": attempt,
+                                },
+                            }
+                        ),
+                    ]
+                )
+                return SimpleNamespace(returncode=1, stdout=stdout, stderr="failed")
+
+            with patch("ensemble_core.providers.shutil.which", return_value="/fake/codex"), patch(
+                "ensemble_core.providers.subprocess.run", side_effect=fake_run
+            ):
+                with self.assertRaises(InfraError) as raised:
+                    run_codex(
+                        bundle_dir=root,
+                        prompt="PROMPT",
+                        schema_path=schema,
+                        schema_kind="test",
+                        model="m",
+                        retries=1,
+                        persist_session=True,
+                    )
+        self.assertEqual(raised.exception.details["usage"]["input_tokens"], 20)
+        self.assertEqual(raised.exception.details["usage"]["output_tokens"], 2)
+        self.assertEqual(len(raised.exception.details["usage_snapshots"]), 1)
+
     def test_codex_review_session_is_created_then_resumed(self) -> None:
         from ensemble_core.providers import run_codex
 
@@ -1176,6 +1234,48 @@ class ProviderCommandTests(unittest.TestCase):
 
 
 class ReviewSessionTests(RunCase):
+    def test_usage_total_adds_only_same_session_increase(self) -> None:
+        def result(input_tokens: int, output_tokens: int, *, resumed: bool) -> ProviderResult:
+            usage = {"input_tokens": input_tokens, "output_tokens": output_tokens}
+            return ProviderResult(
+                payload={},
+                stdout="",
+                stderr="",
+                attempts=1,
+                executable="/fake/codex",
+                version="codex-cli test",
+                model="test-model",
+                session_id="session-123",
+                session_resumed=resumed,
+                usage=usage,
+                usage_snapshots=({"session_id": "session-123", "usage": usage},),
+                attempts_reported=1,
+            )
+
+        record_provider_call(
+            self.run,
+            provider="codex",
+            operation="review",
+            result=result(100, 10, resumed=False),
+            round_number=1,
+        )
+        record_provider_call(
+            self.run,
+            provider="codex",
+            operation="review",
+            result=result(250, 25, resumed=True),
+            round_number=2,
+        )
+
+        manifest = read_json(layout.manifest(self.run))
+        self.assertEqual(manifest["usage"]["codex"]["input_tokens"], 250)
+        self.assertEqual(manifest["usage"]["codex"]["output_tokens"], 25)
+        self.assertEqual(
+            manifest["provider_calls"][1]["usage_attributed"]["input_tokens"],
+            150,
+        )
+        self.assertEqual(manifest["provider_calls"][1]["usage"]["input_tokens"], 250)
+
     def test_review_session_bundle_rejects_allowed_name_symlink(self) -> None:
         request_hash = verified_request_hash(self.run)
         workspace = layout.review_session(self.run, request_hash)

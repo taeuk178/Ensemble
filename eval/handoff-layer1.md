@@ -101,7 +101,7 @@ python3 .claude/skills/ensemble/scripts/review.py eval-run --run <run_dir>
 | 지표 | 원천 | 계산 |
 |---|---|---|
 | `wall_clock_seconds` | `manifest.started_at`, `finished_at` | 차이. `finished_at` 없으면 `null` |
-| `usage` | `manifest.usage` | 제공자별 토큰 합계 그대로. 비어 있으면 `null` |
+| `usage` | `manifest.usage`, `provider_calls` | Codex 지속 세션은 누적 스냅샷의 증가분으로 재계산하고, 그 밖의 제공자는 기록된 합계를 사용. 비어 있으면 `null` |
 | `usage_incomplete` | `manifest.usage.*.calls_unreported` | 하나라도 0이 아니면 true. 이때 토큰 합계는 하한값 |
 
 `provider_calls[].recorded_at` 간격으로 호출별 소요 시간을 추정하지 않는다. 기록 시점은 호출 종료 시점이라 간격에는 Claude의 작성 시간이 섞여 있어 오해를 만든다.

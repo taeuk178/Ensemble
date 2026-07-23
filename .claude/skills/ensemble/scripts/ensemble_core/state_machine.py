@@ -224,6 +224,10 @@ def initialize_run(
         },
         "retries": {"schema": 0, "semantic": 0, "infra": 0},
         "usage": {},
+        # Codex의 turn.completed usage는 세션 누적값이다. 원시 스냅샷은
+        # provider_calls에 남기고, 이 기준값과의 차이만 usage 합계에 더한다.
+        "usage_accounting_version": 2,
+        "usage_session_snapshots": {},
         "warnings": [],
         "environment": environment_snapshot(),
         "provider_calls": [],
@@ -619,6 +623,133 @@ def accumulate_usage(
     totals["calls_reported"] += 1
 
 
+def _normalized_usage(usage: Any) -> dict[str, int] | None:
+    if not isinstance(usage, dict):
+        return None
+    return {
+        key: (
+            int(usage.get(key))
+            if isinstance(usage.get(key), int) and not isinstance(usage.get(key), bool)
+            else 0
+        )
+        for key in USAGE_FIELDS
+    }
+
+
+def _attribute_usage_snapshot(
+    baselines: dict[str, Any],
+    provider: str,
+    usage: Any,
+    *,
+    usage_snapshots: Any = None,
+    fallback_session_id: Any = None,
+) -> tuple[dict[str, int] | None, bool]:
+    """누적 usage 스냅샷을 현재 논리 호출에서 늘어난 값으로 바꾼다.
+
+    반환값의 bool은 세션 차감이 적용됐는지 나타낸다. 세션 ID가 없는 값은
+    독립 호출로 보고 전체를 귀속한다.
+    """
+    records = [
+        item
+        for item in (usage_snapshots or [])
+        if isinstance(item, dict) and _normalized_usage(item.get("usage")) is not None
+    ]
+    normalized = _normalized_usage(usage)
+    if not records and normalized is not None and isinstance(fallback_session_id, str):
+        records = [{"session_id": fallback_session_id, "usage": normalized}]
+    if not records:
+        return normalized, False
+
+    provider_baselines = baselines.setdefault(provider, {})
+    attributed = dict.fromkeys(USAGE_FIELDS, 0)
+    used_session_delta = False
+    for record in records:
+        current = _normalized_usage(record.get("usage"))
+        if current is None:
+            continue
+        session_id = record.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            for key in USAGE_FIELDS:
+                attributed[key] += current[key]
+            continue
+
+        previous = provider_baselines.get(session_id)
+        if not isinstance(previous, dict):
+            delta = current
+        else:
+            prior = _normalized_usage(previous) or dict.fromkeys(USAGE_FIELDS, 0)
+            # 누적 카운터가 하나라도 감소하면 CLI 세션 통계가 재설정된 것으로
+            # 보고 새 스냅샷 전체를 귀속한다. 음수 토큰은 만들지 않는다.
+            reset = any(current[key] < prior[key] for key in USAGE_FIELDS)
+            delta = current if reset else {
+                key: current[key] - prior[key]
+                for key in USAGE_FIELDS
+            }
+        provider_baselines[session_id] = current
+        used_session_delta = True
+        for key in USAGE_FIELDS:
+            attributed[key] += delta[key]
+    return attributed, used_session_delta
+
+
+def _replay_provider_usage(
+    manifest: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """provider_calls를 시간순으로 재생해 세션 누적 중복을 제거한다."""
+    calls = [
+        event
+        for event in (manifest.get("provider_calls") or [])
+        if isinstance(event, dict)
+    ]
+    called_providers = {
+        str(event.get("provider") or "codex")
+        for event in calls
+    }
+    # provider_calls에 없는 작성자(Claude) 등의 별도 수집값은 그대로 보존한다.
+    usage = {
+        str(provider): dict(totals)
+        for provider, totals in (manifest.get("usage") or {}).items()
+        if isinstance(totals, dict) and str(provider) not in called_providers
+    }
+    baselines: dict[str, Any] = {}
+    holder: dict[str, Any] = {"usage": usage}
+    for event in calls:
+        provider = str(event.get("provider") or "codex")
+        attributed, _ = _attribute_usage_snapshot(
+            baselines,
+            provider,
+            event.get("usage"),
+            usage_snapshots=event.get("usage_snapshots"),
+            fallback_session_id=event.get("session_id"),
+        )
+        attempts = event.get("attempts")
+        accumulate_usage(
+            holder,
+            provider,
+            attributed,
+            attempts=int(attempts) if isinstance(attempts, int) else 1,
+            attempts_reported=int(event.get("attempts_reported", 0) or 0),
+        )
+    return holder["usage"], baselines
+
+
+def recompute_usage_from_provider_calls(manifest: dict[str, Any]) -> dict[str, Any]:
+    """구버전 실행도 provider_calls에서 세션 증가분 기준 사용량을 복원한다."""
+    usage, _ = _replay_provider_usage(manifest)
+    return usage
+
+
+def _ensure_usage_accounting_v2(manifest: dict[str, Any]) -> None:
+    """진행 중인 구버전 실행을 새 집계 방식으로 한 번만 올린다."""
+    if int(manifest.get("usage_accounting_version", 0) or 0) >= 2:
+        manifest.setdefault("usage_session_snapshots", {})
+        return
+    usage, baselines = _replay_provider_usage(manifest)
+    manifest["usage"] = usage
+    manifest["usage_session_snapshots"] = baselines
+    manifest["usage_accounting_version"] = 2
+
+
 def record_provider_call(
     run_dir: Path,
     *,
@@ -630,6 +761,7 @@ def record_provider_call(
     error: str | None = None,
 ) -> None:
     manifest = read_json(layout.manifest(run_dir))
+    _ensure_usage_accounting_v2(manifest)
     model = manifest.setdefault("models", {}).setdefault(provider, {})
     model["actual"] = result.model
     model["cli_version"] = result.version
@@ -652,15 +784,25 @@ def record_provider_call(
         "session_resumed": bool(getattr(result, "session_resumed", False)),
         "input_manifest": list(getattr(result, "input_manifest", ()) or ()),
         "usage": getattr(result, "usage", None),
+        "usage_snapshots": list(getattr(result, "usage_snapshots", ()) or ()),
         "attempts_reported": int(getattr(result, "attempts_reported", 0) or 0),
     }
+    attributed_usage, used_session_delta = _attribute_usage_snapshot(
+        manifest.setdefault("usage_session_snapshots", {}),
+        provider,
+        event["usage"],
+        usage_snapshots=event["usage_snapshots"],
+        fallback_session_id=event["session_id"],
+    )
+    event["usage_attributed"] = attributed_usage
+    event["usage_accounting"] = "session_delta" if used_session_delta else "standalone"
     if error:
         event["error"] = error
     manifest.setdefault("provider_calls", []).append(event)
     accumulate_usage(
         manifest,
         provider,
-        event["usage"],
+        attributed_usage,
         attempts=int(result.attempts),
         attempts_reported=int(getattr(result, "attempts_reported", 0) or 0),
     )
@@ -704,6 +846,7 @@ def record_provider_failure(
 ) -> None:
     provider = str(details.get("provider") or "codex")
     manifest = read_json(layout.manifest(run_dir))
+    _ensure_usage_accounting_v2(manifest)
     model = manifest.setdefault("models", {}).setdefault(provider, {})
     if details.get("model"):
         model["actual"] = details["model"]
@@ -713,32 +856,43 @@ def record_provider_failure(
         model["command_path"] = details["command_path"]
     if details.get("reasoning_effort"):
         model["reasoning_effort"] = details["reasoning_effort"]
-    manifest.setdefault("provider_calls", []).append(
-        {
-            "recorded_at": utc_now(),
-            "provider": provider,
-            "operation": operation,
-            "round": round_number,
-            "model": details.get("model"),
-            "cli_version": details.get("cli_version"),
-            "command_path": details.get("command_path"),
-            "reasoning_effort": details.get("reasoning_effort"),
-            "attempts": details.get("attempts"),
-            "attempt_errors": details.get("attempt_errors", []),
-            "input_manifest": details.get("input_manifest", []),
-            "outcome": "FAILED",
-            "error": error,
-            "usage": details.get("usage"),
-            "attempts_reported": int(details.get("attempts_reported", 0) or 0),
-        }
+    event = {
+        "recorded_at": utc_now(),
+        "provider": provider,
+        "operation": operation,
+        "round": round_number,
+        "model": details.get("model"),
+        "cli_version": details.get("cli_version"),
+        "command_path": details.get("command_path"),
+        "reasoning_effort": details.get("reasoning_effort"),
+        "attempts": details.get("attempts"),
+        "attempt_errors": details.get("attempt_errors", []),
+        "input_manifest": details.get("input_manifest", []),
+        "outcome": "FAILED",
+        "error": error,
+        "session_id": details.get("session_id"),
+        "session_resumed": bool(details.get("session_id") and details.get("persist_session")),
+        "usage": details.get("usage"),
+        "usage_snapshots": details.get("usage_snapshots", []),
+        "attempts_reported": int(details.get("attempts_reported", 0) or 0),
+    }
+    attributed_usage, used_session_delta = _attribute_usage_snapshot(
+        manifest.setdefault("usage_session_snapshots", {}),
+        provider,
+        event["usage"],
+        usage_snapshots=event["usage_snapshots"],
+        fallback_session_id=event["session_id"],
     )
+    event["usage_attributed"] = attributed_usage
+    event["usage_accounting"] = "session_delta" if used_session_delta else "standalone"
+    manifest.setdefault("provider_calls", []).append(event)
     # Codex가 실패 시도에도 usage 이벤트를 남기면 합산하고, 보고되지 않은
     # 시도만 하한으로 표시한다. Agy는 현재 사용량 보고 수단이 없다.
     attempts = details.get("attempts")
     accumulate_usage(
         manifest,
         provider,
-        details.get("usage"),
+        attributed_usage,
         attempts=int(attempts) if isinstance(attempts, int) else 1,
         attempts_reported=int(details.get("attempts_reported", 0) or 0),
     )

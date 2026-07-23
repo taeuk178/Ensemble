@@ -42,8 +42,13 @@ class ProviderResult:
     # 순서 실수를 막으려고 키워드 전용으로 둔다.
     #
     # 하나의 논리 호출(run_codex/run_agy 1회) 안에서 사용량을 보고한 모든
-    # 시도의 합이다. 재시도로 버려진 응답의 토큰도 이미 소모됐으므로 포함한다.
+    # 독립 세션의 마지막 누적값을 합친 원시 값이다. 지속 세션에서는 이전
+    # 논리 호출까지 포함할 수 있으므로 집계 전에 `usage_snapshots`의 직전
+    # 값과 차감한다.
     usage: dict[str, int] | None = field(default=None, kw_only=True)
+    # Codex CLI가 보고한 세션별 누적 스냅샷. 같은 세션의 재시도는 마지막
+    # 스냅샷 하나로 접고, 서로 다른 세션에서 소비한 값은 각각 보존한다.
+    usage_snapshots: tuple[dict[str, Any], ...] = field(default=(), kw_only=True)
     # 위 합계에 기여한 시도 수. `attempts`보다 작으면 합계는 하한값이다.
     attempts_reported: int = field(default=0, kw_only=True)
     # Agy에는 파일 읽기 권한을 주지 않고 검증된 번들 파일을 프롬프트에
@@ -226,6 +231,31 @@ def _sum_usages(usages: list[dict[str, int]]) -> dict[str, int] | None:
     return totals
 
 
+def _usage_snapshot_records(
+    session_snapshots: dict[str, dict[str, int]],
+    unscoped_snapshots: list[dict[str, int]],
+) -> list[dict[str, Any]]:
+    """세션별 마지막 누적값과 세션을 알 수 없는 독립 값을 기록 형식으로 만든다."""
+    return [
+        *(
+            {"session_id": session_key, "usage": snapshot}
+            for session_key, snapshot in sorted(session_snapshots.items())
+        ),
+        *(
+            {"session_id": None, "usage": snapshot}
+            for snapshot in unscoped_snapshots
+        ),
+    ]
+
+
+def _fold_usage_snapshots(
+    session_snapshots: dict[str, dict[str, int]],
+    unscoped_snapshots: list[dict[str, int]],
+) -> dict[str, int] | None:
+    """한 논리 호출 안에서 같은 세션의 누적 스냅샷을 중복 합산하지 않는다."""
+    return _sum_usages([*session_snapshots.values(), *unscoped_snapshots])
+
+
 def run_codex(
     *,
     bundle_dir: Path,
@@ -250,6 +280,8 @@ def run_codex(
     last_schema_error: SchemaError | None = None
     attempt_errors: list[dict[str, Any]] = []
     attempt_usages: list[dict[str, int]] = []
+    session_usage_snapshots: dict[str, dict[str, int]] = {}
+    unscoped_usage_snapshots: list[dict[str, int]] = []
     active_session_id = session_id
     for attempt in range(1, retries + 2):
         with tempfile.NamedTemporaryFile(prefix="ensemble-codex-", suffix=".json", delete=False) as handle:
@@ -320,8 +352,18 @@ def run_codex(
             # 스키마 오류 등으로 재시도해도 이미 소모한 토큰은 사라지지 않으므로
             # 검증 전에 시도별 사용량을 먼저 모은다.
             attempt_usage = _codex_usage(completed.stdout)
+            reported_session_id = _codex_session_id(completed.stdout)
             if attempt_usage is not None:
                 attempt_usages.append(attempt_usage)
+                usage_session_id = reported_session_id or active_session_id
+                if usage_session_id:
+                    # 같은 세션의 usage는 턴별 값이 아니라 누적 스냅샷이므로
+                    # 더하지 않고 가장 최신 값을 보존한다.
+                    session_usage_snapshots[usage_session_id] = attempt_usage
+                else:
+                    # 세션 ID가 없으면 독립 시도인지 판별할 수 없어 기존처럼
+                    # 합산하고 하한/상한 판단은 호출 기록에 맡긴다.
+                    unscoped_usage_snapshots.append(attempt_usage)
             if completed.returncode != 0:
                 last_error = {
                     "attempt": attempt,
@@ -331,7 +373,6 @@ def run_codex(
                 }
                 attempt_errors.append(last_error)
                 continue
-            reported_session_id = _codex_session_id(completed.stdout)
             if active_session_id is not None and reported_session_id not in (None, active_session_id):
                 last_error = {
                     "attempt": attempt,
@@ -372,7 +413,16 @@ def run_codex(
                 reasoning_effort=effort,
                 session_id=active_session_id,
                 session_resumed=resuming,
-                usage=_sum_usages(attempt_usages),
+                usage=_fold_usage_snapshots(
+                    session_usage_snapshots,
+                    unscoped_usage_snapshots,
+                ),
+                usage_snapshots=tuple(
+                    _usage_snapshot_records(
+                        session_usage_snapshots,
+                        unscoped_usage_snapshots,
+                    )
+                ),
                 attempts_reported=len(attempt_usages),
             )
         finally:
@@ -391,7 +441,14 @@ def run_codex(
                 "provider": "codex",
                 "session_id": active_session_id,
                 "persist_session": persist_session,
-                "usage": _sum_usages(attempt_usages),
+                "usage": _fold_usage_snapshots(
+                    session_usage_snapshots,
+                    unscoped_usage_snapshots,
+                ),
+                "usage_snapshots": _usage_snapshot_records(
+                    session_usage_snapshots,
+                    unscoped_usage_snapshots,
+                ),
                 "attempts_reported": len(attempt_usages),
             },
         )
@@ -408,7 +465,14 @@ def run_codex(
             "provider": "codex",
             "session_id": active_session_id,
             "persist_session": persist_session,
-            "usage": _sum_usages(attempt_usages),
+            "usage": _fold_usage_snapshots(
+                session_usage_snapshots,
+                unscoped_usage_snapshots,
+            ),
+            "usage_snapshots": _usage_snapshot_records(
+                session_usage_snapshots,
+                unscoped_usage_snapshots,
+            ),
             "attempts_reported": len(attempt_usages),
         },
     )

@@ -43,7 +43,11 @@ from ensemble_core.eval_process import (
 from ensemble_core.eval_quality import compose_pair, compose_repetitions, map_verdict, run_quality_eval
 from ensemble_core.io_utils import atomic_write_json, atomic_write_text, read_json
 from ensemble_core.providers import ProviderResult, _codex_usage
-from ensemble_core.state_machine import accumulate_usage, initialize_run
+from ensemble_core.state_machine import (
+    accumulate_usage,
+    initialize_run,
+    recompute_usage_from_provider_calls,
+)
 
 
 # --- 합성 산출물 ------------------------------------------------------
@@ -178,6 +182,44 @@ class UsageCollectionTests(unittest.TestCase):
         self.assertEqual(totals["calls_unreported"], 1)
         self.assertEqual(totals["calls_reported"], 0)
         self.assertEqual(totals["input_tokens"], 0)
+
+    def test_recomputes_legacy_session_usage_as_deltas(self) -> None:
+        source = {
+            "usage": {
+                "codex": {"input_tokens": 400, "output_tokens": 60},
+                "claude": {"input_tokens": 700, "messages_counted": 3},
+            },
+            "provider_calls": [
+                {
+                    "provider": "codex",
+                    "session_id": "review-session",
+                    "usage": {"input_tokens": 100, "output_tokens": 10},
+                    "attempts": 1,
+                    "attempts_reported": 1,
+                },
+                {
+                    "provider": "codex",
+                    "session_id": "review-session",
+                    "usage": {"input_tokens": 250, "output_tokens": 25},
+                    "attempts": 1,
+                    "attempts_reported": 1,
+                },
+                {
+                    "provider": "codex",
+                    "session_id": None,
+                    "usage": {"input_tokens": 50, "output_tokens": 5},
+                    "attempts": 1,
+                    "attempts_reported": 1,
+                },
+            ],
+        }
+
+        usage = recompute_usage_from_provider_calls(source)
+
+        self.assertEqual(usage["codex"]["input_tokens"], 300)
+        self.assertEqual(usage["codex"]["output_tokens"], 30)
+        self.assertEqual(usage["codex"]["calls_reported"], 3)
+        self.assertEqual(usage["claude"]["input_tokens"], 700)
 
 
 class ClaudeUsageTests(unittest.TestCase):
