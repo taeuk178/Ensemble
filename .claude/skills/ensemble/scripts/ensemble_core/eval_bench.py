@@ -537,7 +537,11 @@ def collect(
         "ensemble_source_hash": next(iter(source_hashes)) if len(source_hashes) == 1 else current_hash,
         "created_at": utc_now(),
         "suite": suite,
+        # 케이스를 걸러 수집하면 세트가 달라지므로 suite_hash도 달라진다.
+        # eval-compare가 전체 수집분과의 비교를 거부하게 두고, 부분 수집이라는
+        # 사실은 case_filter로 드러낸다.
         "suite_hash": suite_hash(cases),
+        "case_filter": case_id,
         "benchmark_run_id": benchmark_run_id,
         "tainted": tainted,
         "model_config": {

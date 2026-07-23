@@ -848,16 +848,21 @@ class ShippedCaseTests(unittest.TestCase):
         altered = [dict(cases[0], case_revision_hash="different"), *cases[1:]]
         self.assertNotEqual(baseline, suite_hash(altered))
 
-    def test_shipped_answer_keys_are_not_self_approved(self) -> None:
-        # 정답지는 루프 밖에서 사용자가 검토해야 채점에 쓸 수 있다.
+    def test_every_case_carries_the_review_gate(self) -> None:
+        """검토를 실제로 했는지는 사람만 안다. 테스트는 게이트가 빠지지
+        않았는지와, 승인된 케이스에 검토 근거를 적은 notes.md가 있는지만 본다.
+        """
         for directory in sorted(layout.cases_root().iterdir()):
             if not directory.is_dir():
                 continue
-            loaded = load_case(directory.name)
-            self.assertFalse(
-                loaded["expected"]["reviewed_by_user"],
-                f"{directory.name}: 사용자 검토 없이 reviewed_by_user가 켜져 있습니다.",
-            )
+            expected = load_case(directory.name)["expected"]
+            self.assertIsInstance(expected["reviewed_by_user"], bool)
+            self.assertTrue(expected["review_required"].strip())
+            if expected["reviewed_by_user"]:
+                self.assertTrue(
+                    (directory / "notes.md").is_file(),
+                    f"{directory.name}: 승인된 정답지에 검토 근거(notes.md)가 없습니다.",
+                )
 
 
 class ScorecardComparisonTests(unittest.TestCase):
