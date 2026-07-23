@@ -118,3 +118,36 @@ python3 .claude/skills/ensemble/scripts/review.py panel --run <run_dir> --issue 
 ```
 
 이 명령들은 판정이 얼마나 안정적인지 확인하고, 추가 판단이 필요한지 알려줍니다. 자동 승인을 만들지는 않습니다.
+
+## 평가 명령
+
+파이프라인이 좋은 명세를 만들어내는지를 측정합니다. 비용이 다른 세 계층으로 나뉘며, 각 명령은 자기보다 비싼 계층을 대신 호출하지 않습니다. 설계는 [evaluator_handoff.md](evaluator_handoff.md)에 있습니다.
+
+```bash
+# 1층 — 끝난 실행의 프로세스 지표. 모델 호출이 없어 비용이 0입니다.
+python3 .claude/skills/ensemble/scripts/review.py eval-run --run <run_dir>
+python3 .claude/skills/ensemble/scripts/review.py eval-run --run <run_dir> --compare <run_dir2> <run_dir3>
+
+# 2층 — 첫 초안과 마지막 초안을 제3 모델이 블라인드 비교. 실행당 심판 2회입니다.
+python3 .claude/skills/ensemble/scripts/review.py eval-quality --run <run_dir>
+
+# 3층 — 고정 케이스 세트로 코드 버전을 평가하고 커밋 간에 비교합니다.
+python3 .claude/skills/ensemble/scripts/review.py eval-bench --suite smoke
+python3 .claude/skills/ensemble/scripts/review.py eval-bench --collect --suite smoke --benchmark-run-id <id>
+python3 .claude/skills/ensemble/scripts/review.py eval-compare --base <sha> --head <sha>
+```
+
+- 평가는 실행 상태를 바꾸지 않습니다. 대상 실행의 `manifest.json`을 건드리지 않고, 평가 중 오류가 나도 실행을 종료 처리하지 않습니다. 결과는 `<run_dir>/eval/`에 남습니다.
+- 어떤 지표도 자동 게이트로 쓰지 않습니다. 실사용 기록으로 분별력이 확인된 뒤에만 게이트 승격을 논의합니다.
+- 토큰은 CLI가 보고한 실측값만 기록합니다. 보고가 없으면 `null`로 두고 호출 횟수만 세며, 금액으로 환산하지 않습니다.
+- 3층 순회는 작성자 단계가 필요하므로 `/ensemble-eval` 스킬이 수행합니다. 케이스 정답지는 사용자가 검토해 `reviewed_by_user: true`로 바꾸기 전까지 `UNREVIEWED`로 표시되고 합계에서 빠집니다.
+
+### 심판 안정성 확인
+
+심판 판정도 흔들립니다. `measure-noise`와 같은 방식으로 반복 측정해 축별 안정성을 확인한 뒤에 결과를 씁니다.
+
+```bash
+python3 .claude/skills/ensemble/scripts/review.py eval-quality --run <run_dir> --repetitions 3
+```
+
+출력의 `composite_distribution`에서 `UNSTABLE` 비율이 높은 축은 심판이나 프롬프트를 신뢰할 수 없다는 뜻입니다. 그 축은 보고에서 빼고 `references/judge-prompt.md`를 고칩니다.
