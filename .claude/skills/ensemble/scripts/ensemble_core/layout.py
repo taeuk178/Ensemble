@@ -235,6 +235,10 @@ def process_metrics(run_dir: Path) -> Path:
     return eval_dir(run_dir) / "process-metrics.json"
 
 
+def process_summary(run_dir: Path) -> Path:
+    return eval_dir(run_dir) / "process-summary.md"
+
+
 def process_metrics_archive(run_dir: Path, stamp: str) -> Path:
     """이전 평가 결과 보존본. 검토 결과를 덮어쓰지 않는 규칙과 같다."""
     return eval_dir(run_dir) / f"process-metrics-{stamp}.json"

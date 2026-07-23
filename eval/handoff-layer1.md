@@ -12,12 +12,22 @@ python3 .claude/skills/ensemble/scripts/review.py eval-run --run <run_dir>
 
 - 입력(레이아웃 v2, 반드시 `layout.py` 헬퍼로 접근): `_state/manifest.json`, `_state/convergence.json`, `_state/issue-registry.json`, `04-reviews/blind/draft-<NN>[-attempt-<M>].json`, `04-reviews/reconciliation/draft-<NN>[-attempt-<M>].json`
 - 독립 검토 파일명 끝의 숫자는 회차가 아니라 **시도 번호**다. 사전순 정렬은 `draft-00-attempt-2.json`을 `draft-00.json`보다 앞에 두므로 쓰지 않는다. (초안 번호, 시도 번호) 전용 키로 정렬하는 헬퍼(`layout.attempt_of`)를 추가해 쓰고, 접미사 없는 원본 파일은 시도 1로 취급한다.
-- 출력: stdout으로 JSON을 출력하고 `<run_dir>/eval/process-metrics.json`(`layout.process_metrics`)에 저장한다
+- 출력: stdout에는 기본적으로 표시용 요약 JSON을 출력하고,
+  `<run_dir>/eval/process-summary.md`에 사람이 읽는 표·막대를 저장한다.
+  원시 지표는 `<run_dir>/eval/process-metrics.json`에 보존하며 `--raw`로
+  stdout에서도 볼 수 있다
 - 이 명령은 실행 상태를 바꾸지 않는다. `assert_source_unchanged` 검사를 하지 않는다 — 평가는 실행이 끝난 뒤 다른 코드 버전에서 수행해도 유효하며, 대신 출력에 평가 시점의 코드 해시를 함께 기록해 구분한다
 
 ## 2. 지표 정의
 
 각 지표는 이름, 계산 원천, 계산식으로 정의한다. 원천 필드가 없거나 실행이 미완료면 해당 지표는 `null`로 기록하고 실패하지 않는다.
+
+표시 계층은 원시 값을 바꾸지 않는다. 비율은 `37.5% (3/8)`처럼 퍼센트와
+분자·분모를 함께 표시하고, 시간은 분/시간, 토큰은 K/M 단위로 줄인다.
+내부 JSON에서는 기존 호환성을 위해 `leakage_rate_*` 이름을 유지한다. 사람이 읽는
+요약에서는 이를 **“일반 검토가 놓친 문제 비율”**로 표시하고, 항상
+**“낮을수록 좋음”**을 함께 쓴다. `lower_bound`는 “놓친 문제 최소 확인값”,
+미승격 발견은 “발견했지만 고치지 못한 문제”로 풀어 쓴다.
 
 ### 2.1 수렴 효율
 
@@ -34,7 +44,7 @@ python3 .claude/skills/ensemble/scripts/review.py eval-run --run <run_dir>
 | `open_backlog_by_round` | `convergence.rounds[].open_backlog` | 라운드 순 배열 |
 | `rounds_to_zero_backlog` | 위 배열 | `open_backlog`가 0이 된 첫 라운드. 없으면 `null` |
 
-### 2.2 누출률 (핵심 지표)
+### 2.2 일반 검토가 놓친 문제 비율 (내부 필드명: leakage rate)
 
 일반 검토 루프가 승인한 초안을 최종 독립 검토가 다시 봤을 때 새 진행 차단 이슈가 나오면, 루프가 그만큼 놓친 것이다.
 

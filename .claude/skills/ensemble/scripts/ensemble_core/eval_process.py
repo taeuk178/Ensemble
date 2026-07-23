@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .environment import ensemble_source_hash, git_commit
-from .io_utils import atomic_write_json, read_json, utc_now
+from .io_utils import atomic_write_json, atomic_write_text, read_json, utc_now
 from . import layout
 
 
@@ -92,7 +92,7 @@ def _leakage_metrics(
     reconciliations: list[tuple[str, dict[str, Any]]],
     warnings: list[str],
 ) -> dict[str, Any]:
-    """누출률 — 일반 검토 루프가 놓치고 최종 독립 검토가 잡아낸 비율.
+    """놓친 문제 비율 — 일반 검토가 놓치고 마지막 새 검토가 잡아낸 비율.
 
     blind 원문의 `blocking_issues`를 그대로 합산하면 위험 수용과의 일치,
     시도 간 반복, 승격된 이슈가 겹쳐 과계산된다. 비율의 분자·분모는 registry의
@@ -155,12 +155,13 @@ def _leakage_metrics(
     )
     if unpromoted:
         warnings.append(
-            "승격되지 않은 미수용 발견이 남아 있어 누출률 분자가 실제보다 작습니다: "
-            f"{unpromoted}건"
+            "마지막 검토에서 찾았지만 수정 절차로 돌려보내지 못한 문제가 남았습니다. "
+            f"따라서 '최소 확인값'은 실제보다 작습니다: {unpromoted}건"
         )
     if unknown_origin:
         warnings.append(
-            f"기원을 알 수 없는 이슈 {unknown_origin}건은 누출률 계산에서 제외했습니다."
+            f"처음 발견된 단계를 알 수 없는 문제 {unknown_origin}건은 "
+            "'일반 검토가 놓친 문제' 계산에서 제외했습니다."
         )
     return {
         "final_blind_attempts": len(final_blinds),
@@ -267,8 +268,8 @@ def _resource_metrics(manifest: dict[str, Any], warnings: list[str]) -> dict[str
     )
     if unreported_calls or unreported_attempts:
         warnings.append(
-            "사용량을 보고하지 않은 호출이 있어 해당 제공자의 토큰 합계는 하한값입니다: "
-            f"논리 호출 {unreported_calls}건, 시도 {unreported_attempts}건"
+            "토큰을 기록하지 못한 AI 호출이 있습니다. 표시된 사용량보다 실제 사용량이 "
+            f"더 많을 수 있습니다: 호출 {unreported_calls}건, 재시도 {unreported_attempts}건"
         )
     # 제공자마다 오차의 방향이 다르다. CLI 제공자는 미보고 호출 때문에
     # 하한값이고, 작성자는 시간 창에 무관한 작업이 섞일 수 있어 상한값이다.
@@ -278,8 +279,8 @@ def _resource_metrics(manifest: dict[str, Any], warnings: list[str]) -> dict[str
     )
     if upper_bound_providers:
         warnings.append(
-            "시간 창으로 귀속한 제공자가 있어 그 합계는 상한값입니다: "
-            f"{', '.join(upper_bound_providers)}"
+            "다른 작업의 토큰이 함께 집계됐을 수 있어 실제 사용량보다 많게 표시될 수 "
+            f"있습니다: {', '.join(upper_bound_providers)}"
         )
     return {
         "wall_clock_seconds": wall_clock,
@@ -289,6 +290,303 @@ def _resource_metrics(manifest: dict[str, Any], warnings: list[str]) -> dict[str
         "usage_unreported_attempts": unreported_attempts,
         "usage_upper_bound_providers": upper_bound_providers,
     }
+
+
+def _percent(value: float | None) -> float | None:
+    return round(value * 100, 1) if isinstance(value, (int, float)) else None
+
+
+def _compact_number(value: Any) -> str:
+    if not isinstance(value, int) or isinstance(value, bool):
+        return "—"
+    absolute = abs(value)
+    if absolute >= 1_000_000:
+        return f"{value / 1_000_000:.2f}M"
+    if absolute >= 1_000:
+        return f"{value / 1_000:.1f}K"
+    return str(value)
+
+
+def _duration(seconds: Any) -> str:
+    if not isinstance(seconds, (int, float)):
+        return "—"
+    total = max(int(round(seconds)), 0)
+    hours, remainder = divmod(total, 3600)
+    minutes, remaining_seconds = divmod(remainder, 60)
+    parts: list[str] = []
+    if hours:
+        parts.append(f"{hours}시간")
+    if minutes:
+        parts.append(f"{minutes}분")
+    if remaining_seconds or not parts:
+        parts.append(f"{remaining_seconds}초")
+    return " ".join(parts)
+
+
+def _rate(value: float | None, numerator: int, denominator: int) -> dict[str, Any]:
+    return {
+        "value": value,
+        "percent": _percent(value),
+        "numerator": numerator,
+        "denominator": denominator,
+        "fraction": f"{numerator}/{denominator}" if denominator else "—",
+    }
+
+
+def _display_summary(metrics: dict[str, Any]) -> dict[str, Any]:
+    convergence = metrics["convergence"]
+    leakage = metrics["leakage"]
+    issues = metrics["issues"]
+    friction = metrics["friction"]
+    resources = metrics["resources"]
+
+    iterative = _int(leakage.get("unique_iterative_origin_blockers"))
+    promoted = _int(leakage.get("unique_promoted_final_blind_blockers"))
+    observed_final = _int(leakage.get("unique_observed_final_blind_blockers"))
+    lower_denominator = iterative + promoted
+    observed_denominator = iterative + observed_final
+    review_calls = _int((friction.get("provider_call_count") or {}).get("review"))
+    reuse_rate = friction.get("session_reuse_rate")
+    reused_calls = round(reuse_rate * review_calls) if isinstance(reuse_rate, (int, float)) else 0
+    dispositions = issues.get("dispositions") or {}
+    disposition_total = sum(
+        value for value in dispositions.values() if isinstance(value, int) and not isinstance(value, bool)
+    )
+
+    usage_display: dict[str, dict[str, Any]] = {}
+    for provider, totals in (resources.get("usage") or {}).items():
+        if not isinstance(totals, dict):
+            continue
+        if totals.get("upper_bound"):
+            bound = "upper_bound"
+        elif _int(totals.get("calls_unreported")) or _int(totals.get("attempts_unreported")):
+            bound = "lower_bound"
+        else:
+            bound = "reported"
+        usage_display[str(provider)] = {
+            "calls": (
+                _int(totals.get("calls_reported")) + _int(totals.get("calls_unreported"))
+                if "calls_reported" in totals or "calls_unreported" in totals
+                else None
+            ),
+            "messages": totals.get("messages_counted"),
+            "input_tokens": _compact_number(totals.get("input_tokens")),
+            "cached_input_tokens": _compact_number(totals.get("cached_input_tokens")),
+            "output_tokens": _compact_number(totals.get("output_tokens")),
+            "reasoning_output_tokens": _compact_number(totals.get("reasoning_output_tokens")),
+            "bound": bound,
+        }
+
+    attempts = leakage.get("attempts") or []
+    passed_attempts = sum(1 for attempt in attempts if attempt.get("passed") is True)
+    return {
+        "status": {
+            "value": convergence.get("final_state"),
+            "clean": bool(convergence.get("terminated_cleanly")),
+        },
+        "review_flow": {
+            "iterative_reviews": _int(convergence.get("iterative_reviews")),
+            "promotions": _int(convergence.get("promotions")),
+            "sequence_rounds": _int(convergence.get("sequence_rounds")),
+            "draft_rounds": convergence.get("draft_rounds"),
+            "final_blind_attempts": _int(leakage.get("final_blind_attempts")),
+            "final_blind_passes": passed_attempts,
+        },
+        "leakage": {
+            "lower_bound": _rate(
+                leakage.get("leakage_rate_lower_bound"),
+                promoted,
+                lower_denominator,
+            ),
+            "observed": _rate(
+                leakage.get("leakage_rate_observed"),
+                observed_final,
+                observed_denominator,
+            ),
+            "iterative_findings": iterative,
+            "final_blind_findings": observed_final,
+            "promoted_findings": promoted,
+            "unpromoted_findings": _int(
+                leakage.get("unique_unpromoted_final_blind_blockers")
+            ),
+        },
+        "efficiency": {
+            "session_reuse": _rate(reuse_rate, reused_calls, review_calls),
+            "wall_clock_seconds": resources.get("wall_clock_seconds"),
+            "wall_clock": _duration(resources.get("wall_clock_seconds")),
+            "provider_calls": sum(
+                value
+                for value in (friction.get("provider_call_count") or {}).values()
+                if isinstance(value, int) and not isinstance(value, bool)
+            ),
+            "user_decisions": _int((friction.get("user_decisions") or {}).get("count")),
+        },
+        "issues": {
+            "unique_issues": _int(issues.get("total_issues")),
+            "author_accepts": _int(dispositions.get("ACCEPT")),
+            "author_decisions": disposition_total,
+            "author_acceptance_percent": _percent(issues.get("acceptance_rate")),
+            "regressions": _int(issues.get("regression_count")),
+        },
+        "usage": usage_display,
+    }
+
+
+def _bar(value: int, total: int, width: int = 12) -> str:
+    if total <= 0:
+        return "·" * width
+    filled = min(max(round(width * value / total), 0), width)
+    return "█" * filled + "·" * (width - filled)
+
+
+def render_process_summary(result: dict[str, Any]) -> str:
+    display = result["display"]
+    status = display["status"]
+    flow = display["review_flow"]
+    leakage = display["leakage"]
+    efficiency = display["efficiency"]
+    issues = display["issues"]
+    observed = leakage["observed"]
+    lower = leakage["lower_bound"]
+    total_findings = leakage["iterative_findings"] + leakage["final_blind_findings"]
+    status_note = "정상 종료" if status["clean"] else "완료 기준 미충족"
+    friendly_status = {
+        "INITIALIZED": "시작됨",
+        "DRAFT_READY": "초안 검토 준비됨",
+        "NEEDS_REVISION": "수정할 문제 있음",
+        "APPROVED": "일반 검토 통과",
+        "USER_DECISION_REQUIRED": "사용자 결정 필요",
+        "ESCALATION_REQUIRED": "추가 판단 필요",
+        "CONVERGED": "모든 검토 통과",
+        "STABLE_DISSENT": "의견 차이를 기록하고 종료",
+        "ITERATION_LIMIT_REACHED": "검토 횟수 한도에 도달",
+        "PROTOTYPE_INCOMPLETE": "수정할 문제가 남음",
+        "RUN_TAINTED": "실행 중 코드가 바뀜",
+    }.get(status["value"], str(status["value"]))
+    observed_percent = observed["percent"] if observed["percent"] is not None else "—"
+    lower_percent = lower["percent"] if lower["percent"] is not None else "—"
+    if observed["denominator"]:
+        plain_result = (
+            f"문제 {observed['denominator']}건 중 **{observed['numerator']}건**을 "
+            "일반 검토에서 찾지 못하고 마지막 검토에서 뒤늦게 찾았습니다."
+        )
+    else:
+        plain_result = "비율을 계산할 문제가 없어 이번 실행의 놓친 문제 비율은 표시하지 않습니다."
+
+    lines = [
+        "# 검토 결과 요약",
+        "",
+        f"- 실행: `{result.get('run_id')}`",
+        f"- 평가 시각: `{result.get('evaluated_at')}`",
+        f"- 종료 상태: **{friendly_status}** (`{status['value']}`) — {status_note}",
+        "",
+        "## 가장 중요한 결과",
+        "",
+        plain_result,
+        "",
+        (
+            f"> **일반 검토가 놓친 문제: {observed_percent}% "
+            f"({observed['fraction']}) — 낮을수록 좋습니다.**"
+        ),
+        "> 0%라면 마지막 검토에서 새 문제가 나오지 않았다는 뜻입니다.",
+        "",
+        "## 한눈에 보기",
+        "",
+        "| 무엇을 봤나요? | 결과 | 읽는 방법 |",
+        "|---|---:|---|",
+        (
+            f"| 일반 검토가 놓친 문제 | **{observed_percent}% "
+            f"({observed['fraction']})** | 낮을수록 좋음 · 마지막 검토에서 뒤늦게 찾은 문제 |"
+        ),
+        (
+            f"| 놓친 문제 최소 확인값 | {lower_percent}% "
+            f"({lower['fraction']}) | 확실히 수정 절차로 돌아간 문제만 센 값 · 실제 값은 이보다 클 수 있음 |"
+        ),
+        (
+            f"| 발견했지만 고치지 못한 문제 | **{leakage['unpromoted_findings']}건** "
+            "| 실행 한도에 걸려 수정 기회를 얻지 못함 |"
+        ),
+        (
+            f"| 마지막 새 검토 통과 | **{flow['final_blind_passes']}/"
+            f"{flow['final_blind_attempts']}회** | 높을수록 좋음 · 새 문제가 없을 때 통과 |"
+        ),
+        f"| 걸린 시간 | **{efficiency['wall_clock']}** | 시작부터 종료까지 걸린 시간 |",
+        "",
+        "## 문제를 언제 찾았나요?",
+        "",
+        "| 발견 시점 | 분포 | 문제 수 |",
+        "|---|---|---:|",
+        (
+            f"| 일반 검토 | `{_bar(leakage['iterative_findings'], total_findings)}` "
+            f"| {leakage['iterative_findings']}/{total_findings} |"
+        ),
+        (
+            f"| 마지막 새 검토 | `{_bar(leakage['final_blind_findings'], total_findings)}` "
+            f"| {leakage['final_blind_findings']}/{total_findings} |"
+        ),
+        "",
+        (
+            f"마지막 검토에서 뒤늦게 찾은 {leakage['final_blind_findings']}건 중 "
+            f"{leakage['promoted_findings']}건은 수정 절차로 돌려보냈고, "
+            f"{leakage['unpromoted_findings']}건은 고치지 못한 채 남았습니다."
+        ),
+        "",
+        "## 검토 과정",
+        "",
+        "| 항목 | 값 |",
+        "|---|---:|",
+        f"| 일반 검토 | {flow['iterative_reviews']}회 |",
+        f"| 마지막 검토 문제를 수정 절차로 돌려보냄 | {flow['promotions']}회 |",
+        f"| 전체 검토 단계 | {flow['sequence_rounds']}회 |",
+        f"| 초안 | {flow['draft_rounds'] if flow['draft_rounds'] is not None else '—'}개 |",
+        (
+            f"| 검토 세션 재사용 | "
+            f"{efficiency['session_reuse']['percent'] if efficiency['session_reuse']['percent'] is not None else '—'}% "
+            f"({efficiency['session_reuse']['fraction']}) |"
+        ),
+        f"| 사용자 결정 | {efficiency['user_decisions']}회 |",
+        f"| AI 호출 | {efficiency['provider_calls']}회 |",
+        "",
+        "## 문제 처리",
+        "",
+        f"- 서로 다른 문제: **{issues['unique_issues']}건**",
+        (
+            f"- 작성자가 수정 필요성을 인정한 판단: **{issues['author_accepts']}/{issues['author_decisions']}** "
+            f"({issues['author_acceptance_percent'] if issues['author_acceptance_percent'] is not None else '—'}%)"
+        ),
+        "- 같은 문제를 여러 차례 다시 판단할 수 있어 판단 횟수와 문제 수는 다를 수 있습니다.",
+        f"- 수정하면서 다시 생긴 문제: **{issues['regressions']}건**",
+    ]
+
+    if display["usage"]:
+        lines.extend(
+            [
+                "",
+                "## AI 사용량",
+                "",
+                "| AI | 호출/메시지 | 입력 | 재사용한 입력 | 출력 | 생각에 쓴 출력 | 집계 상태 |",
+                "|---|---:|---:|---:|---:|---:|---|",
+            ]
+        )
+        bound_labels = {
+            "reported": "모두 집계됨",
+            "lower_bound": "실제보다 적을 수 있음",
+            "upper_bound": "실제보다 많을 수 있음",
+        }
+        for provider, usage in sorted(display["usage"].items()):
+            volume = usage["calls"] if usage["calls"] is not None else usage["messages"]
+            lines.append(
+                f"| {provider} | {volume if volume is not None else '—'} | "
+                f"{usage['input_tokens']} | {usage['cached_input_tokens']} | "
+                f"{usage['output_tokens']} | {usage['reasoning_output_tokens']} | "
+                f"{bound_labels[usage['bound']]} |"
+            )
+
+    warnings = result.get("warnings") or []
+    if warnings:
+        lines.extend(["", "## 해석 주의", ""])
+        lines.extend(f"- {warning}" for warning in warnings)
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def compute_process_metrics(
@@ -308,7 +606,7 @@ def compute_process_metrics(
         (record for record in (convergence.get("rounds") or []) if isinstance(record, dict)),
         key=lambda record: _int(record.get("round")),
     )
-    return {
+    metrics = {
         "convergence": _convergence_metrics(manifest, rounds, warnings),
         "leakage": _leakage_metrics(registry, final_blinds, reconciliations, warnings),
         "issues": _issue_metrics(registry, rounds),
@@ -316,6 +614,8 @@ def compute_process_metrics(
         "resources": _resource_metrics(manifest, warnings),
         "warnings": warnings,
     }
+    metrics["display"] = _display_summary(metrics)
+    return metrics
 
 
 def _load_pairs(paths: list[Path]) -> list[tuple[str, dict[str, Any]]]:
@@ -389,6 +689,7 @@ def _write_metrics(run_dir: Path, result: dict[str, Any]) -> None:
             if not archive.exists():
                 atomic_write_json(archive, previous, overwrite=False)
     atomic_write_json(path, result)
+    atomic_write_text(layout.process_summary(run_dir), render_process_summary(result))
 
 
 def load_or_compute(run_dir: Path) -> dict[str, Any]:

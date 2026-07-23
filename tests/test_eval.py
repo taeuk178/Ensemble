@@ -34,7 +34,12 @@ from ensemble_core.eval_bench import (
     validate_benchmark_block,
     validate_expected,
 )
-from ensemble_core.eval_process import compare_runs, compute_process_metrics, evaluate_run
+from ensemble_core.eval_process import (
+    compare_runs,
+    compute_process_metrics,
+    evaluate_run,
+    render_process_summary,
+)
 from ensemble_core.eval_quality import compose_pair, compose_repetitions, map_verdict, run_quality_eval
 from ensemble_core.io_utils import atomic_write_json, atomic_write_text, read_json
 from ensemble_core.providers import ProviderResult, _codex_usage
@@ -403,6 +408,8 @@ class ProcessMetricsTests(unittest.TestCase):
         self.assertEqual(result["issues"]["acceptance_rate"], 0.5)
         self.assertEqual(result["friction"]["session_reuse_rate"], 0.5)
         self.assertEqual(result["resources"]["wall_clock_seconds"], 600.0)
+        self.assertEqual(result["display"]["efficiency"]["wall_clock"], "10분")
+        self.assertEqual(result["display"]["efficiency"]["session_reuse"]["percent"], 50.0)
 
     def test_leakage_rate_splits_attempt_counts(self) -> None:
         blinds = [
@@ -453,7 +460,7 @@ class ProcessMetricsTests(unittest.TestCase):
         self.assertEqual(result["leakage"]["unique_promoted_final_blind_blockers"], 0)
         self.assertEqual(result["leakage"]["leakage_rate_lower_bound"], 0.0)
         self.assertEqual(result["leakage"]["unpromoted_unaccepted_last_attempt"], 2)
-        self.assertTrue(any("승격되지 않은" in warning for warning in result["warnings"]))
+        self.assertTrue(any("수정 절차로 돌려보내지 못한" in warning for warning in result["warnings"]))
 
     def test_observed_leakage_deduplicates_repeated_final_findings(self) -> None:
         def finding(criterion: str, fingerprint: str) -> dict:
@@ -516,6 +523,13 @@ class ProcessMetricsTests(unittest.TestCase):
         self.assertEqual(leakage["unique_observed_final_blind_blockers"], 5)
         self.assertEqual(leakage["unique_unpromoted_final_blind_blockers"], 2)
         self.assertEqual(leakage["leakage_rate_observed"], 0.5)
+        summary = render_process_summary(
+            {"run_id": "run", "evaluated_at": "now", **result}
+        )
+        self.assertIn("50.0% (5/10)", summary)
+        self.assertIn("37.5% (3/8)", summary)
+        self.assertIn("문제 10건 중 **5건**", summary)
+        self.assertIn("낮을수록 좋습니다", summary)
 
     def test_unknown_origin_issues_are_excluded_from_the_rate(self) -> None:
         result = compute_process_metrics(
@@ -649,6 +663,20 @@ class EvalRunIoTests(EvalRunCase):
         evaluate_run(self.run)
         self.assertEqual(layout.manifest(self.run).read_text(encoding="utf-8"), before)
         self.assertTrue(layout.process_metrics(self.run).exists())
+        self.assertTrue(layout.process_summary(self.run).exists())
+
+    def test_human_summary_shows_percentages_and_fractions(self) -> None:
+        current = read_json(layout.manifest(self.run))
+        current["finished_at"] = "2026-07-23T00:26:00Z"
+        current["started_at"] = "2026-07-23T00:00:00Z"
+        atomic_write_json(layout.manifest(self.run), current)
+        evaluate_run(self.run)
+        summary = layout.process_summary(self.run).read_text(encoding="utf-8")
+        self.assertIn("# 검토 결과 요약", summary)
+        self.assertIn("26분", summary)
+        self.assertIn("일반 검토가 놓친 문제", summary)
+        self.assertIn("낮을수록 좋습니다", summary)
+        self.assertIn("서로 다른 문제", summary)
 
     def test_previous_result_is_archived_not_overwritten(self) -> None:
         evaluate_run(self.run)

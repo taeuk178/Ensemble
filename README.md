@@ -129,6 +129,7 @@ python3 .claude/skills/ensemble/scripts/review.py preflight --live-agy
 ```bash
 # 1층 — 끝난 실행의 프로세스 지표. 모델 호출이 없어 비용이 0입니다.
 python3 .claude/skills/ensemble/scripts/review.py eval-run --run <run_dir>
+python3 .claude/skills/ensemble/scripts/review.py eval-run --run <run_dir> --raw
 python3 .claude/skills/ensemble/scripts/review.py eval-run --run <run_dir> --compare <run_dir2> <run_dir3>
 
 # 2층 — 첫 초안과 마지막 초안을 제3 모델이 블라인드 비교. 실행당 심판 2회입니다.
@@ -142,6 +143,7 @@ python3 .claude/skills/ensemble/scripts/review.py eval-compare --base <sha> --he
 ```
 
 - 평가는 실행 상태를 바꾸지 않습니다. 대상 실행의 `manifest.json`을 건드리지 않고, 평가 중 오류가 나도 실행을 종료 처리하지 않습니다. 결과는 `<run_dir>/eval/`에 남습니다.
+- `eval-run`은 기본적으로 퍼센트·분자/분모·압축 토큰 단위를 사용한 표시용 요약을 출력하고 `process-summary.md`를 만듭니다. 전체 원시 지표가 필요할 때만 `--raw`를 사용합니다.
 - 어떤 지표도 자동 게이트로 쓰지 않습니다. 실사용 기록으로 분별력이 확인된 뒤에만 게이트 승격을 논의합니다.
 - 토큰은 실측값만 기록합니다. 프롬프트 길이로 추정하지 않고, 금액으로 환산하지 않습니다.
 - 토큰은 세 주체를 모두 셉니다. **Codex와 Agy는 하한값**입니다 — 사용량을 보고하지 않은 호출이 있으면 그만큼 빠집니다. **작성자(Claude)는 상한값**입니다 — 세션 기록이 실행 단위가 아니라 세션 단위라서, 같은 시간대의 다른 작업이 섞일 수 있습니다. 오차의 방향이 반대이므로 한 숫자로 합치지 않고 제공자별로 표시합니다.

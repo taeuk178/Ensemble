@@ -527,7 +527,19 @@ def command_eval_run(args: argparse.Namespace) -> dict[str, Any]:
     run_dir = resolve_run(args.run)
     if args.compare:
         return compare_runs([run_dir, *(resolve_run(value) for value in args.compare)])
-    return evaluate_run(run_dir)
+    result = evaluate_run(run_dir)
+    if getattr(args, "raw", False):
+        return result
+    return {
+        "run_id": result.get("run_id"),
+        "evaluated_at": result.get("evaluated_at"),
+        "summary": result.get("display"),
+        "artifacts": {
+            "summary": str(layout.process_summary(run_dir)),
+            "metrics": str(layout.process_metrics(run_dir)),
+        },
+        "warnings": result.get("warnings", []),
+    }
 
 
 def command_eval_quality(args: argparse.Namespace) -> dict[str, Any]:
@@ -738,6 +750,7 @@ def build_parser() -> argparse.ArgumentParser:
     eval_run = subparsers.add_parser("eval-run", help="완료된 실행의 프로세스 지표 계산 (1층, 비용 없음)")
     eval_run.add_argument("--run", required=True)
     eval_run.add_argument("--compare", nargs="+", metavar="RUN")
+    eval_run.add_argument("--raw", action="store_true", help="표시용 요약 대신 전체 원시 지표 출력")
     eval_run.set_defaults(func=command_eval_run)
 
     eval_quality = subparsers.add_parser(
