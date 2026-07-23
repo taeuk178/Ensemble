@@ -6,15 +6,20 @@ from typing import Any
 
 from .config import (
     CRITERIA,
+    DEFAULT_MAX_FINAL_BLIND_ATTEMPTS,
     DEFAULT_MAX_PANEL_CALLS,
     DEFAULT_MAX_ROUNDS,
+    DEFAULT_MAX_TOTAL_PROVIDER_CALLS,
     DEFAULT_PANEL_EFFORT,
     DEFAULT_PANEL_MODEL,
     DEFAULT_REVIEW_EFFORT,
     DEFAULT_REVIEW_MODEL,
+    DEFAULT_REVIEW_SESSION_MAX_ROUNDS,
     RUNS_ROOT,
+    OPEN_STATUSES,
     PAUSED_STATES,
     TERMINAL_STATES,
+    USAGE_FIELDS,
 )
 from .environment import ensemble_source_hash, environment_snapshot
 from .errors import InputError, StateError
@@ -23,6 +28,7 @@ from . import layout
 from .io_utils import (
     atomic_write_json,
     atomic_write_text,
+    detect_sensitive_text,
     find_consumed_request_hash,
     make_run_id,
     read_json,
@@ -94,11 +100,34 @@ def initialize_run(
     panel_model: str = DEFAULT_PANEL_MODEL,
     panel_effort: str = DEFAULT_PANEL_EFFORT,
     max_rounds: int = DEFAULT_MAX_ROUNDS,
+    max_final_blind_attempts: int = DEFAULT_MAX_FINAL_BLIND_ATTEMPTS,
+    max_total_provider_calls: int = DEFAULT_MAX_TOTAL_PROVIDER_CALLS,
     max_panel_calls: int = DEFAULT_MAX_PANEL_CALLS,
     allow_reuse: bool = False,
+    allow_sensitive: bool = False,
+    label: str | None = None,
+    author_model: str | None = None,
+    benchmark: dict[str, Any] | None = None,
+    reset_review_session_after_promotion: bool = True,
 ) -> Path:
     if not request.strip():
         raise InputError("요청 내용이 비어 있습니다.")
+    for name, value in {
+        "max_rounds": max_rounds,
+        "max_final_blind_attempts": max_final_blind_attempts,
+        "max_total_provider_calls": max_total_provider_calls,
+        "max_panel_calls": max_panel_calls,
+    }.items():
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise InputError(f"{name}은 1 이상의 정수여야 합니다.")
+    # 비밀정보 차단은 실행이 만들어지기 전에 일어나야 하므로 여기서 본다.
+    # 3층 `init_block` 케이스가 검증하는 지점도 이 검사다.
+    sensitive = detect_sensitive_text(request)
+    if sensitive and not allow_sensitive:
+        raise InputError(
+            "외부 모델에 보내면 안 될 수 있는 민감정보 패턴이 감지됐습니다.",
+            details={"patterns": sensitive, "override": "--allow-sensitive"},
+        )
     request_hash = sha256_text(request)
     reused = find_consumed_request_hash(request_hash)
     if reused and not allow_reuse:
@@ -121,6 +150,14 @@ def initialize_run(
         ensure_trailing_newline=False,
     )
     atomic_write_text(layout.rubric(run_dir), render_rubric(), overwrite=False)
+    atomic_write_json(
+        layout.user_decisions(run_dir),
+        {"schema_version": 1, "decisions": []},
+        overwrite=False,
+    )
+    user_decisions_hash = sha256_text(
+        layout.user_decisions(run_dir).read_text(encoding="utf-8")
+    )
     atomic_write_json(layout.registry(run_dir), {}, overwrite=False)
     atomic_write_json(layout.reviewer_index(run_dir), [], overwrite=False)
     atomic_write_json(layout.convergence(run_dir), {"rounds": [], "events": []}, overwrite=False)
@@ -131,9 +168,24 @@ def initialize_run(
         "layout_version": layout.LAYOUT_VERSION,
         "run_id": run_id,
         "phase": phase,
+        # 사람이 읽는 표식. 실행 식별에는 쓰지 않는다(아래 benchmark 참조).
+        "label": (label or "").strip() or None,
+        # 벤치마크 실행을 케이스에 잇는 계약. runner는 label이 아니라
+        # 이 블록(benchmark_run_id, case_id, case_revision_hash 등)으로
+        # 실행을 수집한다.
+        "benchmark": benchmark,
         "state": "INITIALIZED",
+        "state_history": [
+            {
+                "recorded_at": utc_now(),
+                "from": None,
+                "to": "INITIALIZED",
+                "reason": "run initialized",
+            }
+        ],
         "current_round": 0,
         "request_hash": request_hash,
+        "user_decisions_hash": user_decisions_hash,
         "started_at": utc_now(),
         "finished_at": None,
         "termination_reason": None,
@@ -152,19 +204,46 @@ def initialize_run(
                 "requested_reasoning_effort": panel_effort,
                 "reasoning_effort": None,
             },
+            # 작성자(Claude) 런타임은 CLI가 감지할 수 없어 호출자가 알려준
+            # 값만 기록한다. 점수 비교 시 모델 구성이 같은지 확인하는 용도다.
+            "author": {"requested": (author_model or "").strip() or None},
         },
-        "limits": {"review_rounds": max_rounds, "panel_calls": max_panel_calls},
+        "limits": {
+            # review_rounds는 구버전 소비자를 위한 별칭이다.
+            "review_rounds": max_rounds,
+            "iterative_reviews": max_rounds,
+            "final_blind_attempts": max_final_blind_attempts,
+            "total_provider_calls": max_total_provider_calls,
+            "panel_calls": max_panel_calls,
+        },
+        "counters": {
+            "sequence_round": 0,
+            "iterative_reviews": 0,
+            "promotions": 0,
+            "final_blind_attempts": 0,
+        },
         "retries": {"schema": 0, "semantic": 0, "infra": 0},
         "usage": {},
+        # Codex의 turn.completed usage는 세션 누적값이다. 원시 스냅샷은
+        # provider_calls에 남기고, 이 기준값과의 차이만 usage 합계에 더한다.
+        "usage_accounting_version": 2,
+        "usage_session_snapshots": {},
         "warnings": [],
         "environment": environment_snapshot(),
         "provider_calls": [],
         "codex_review_session": None,
+        "review_session_policy": {
+            "reset_after_final_promotion": bool(reset_review_session_after_promotion),
+            "max_rounds_per_session": DEFAULT_REVIEW_SESSION_MAX_ROUNDS,
+            "epoch": 0,
+            "reset_count": 0,
+        },
         "retry_events": [],
         "review_history": [],
         "user_decisions": [],
         "pending_user_issue_ids": [],
         "pending_panel_issue_ids": [],
+        "repair_plan_required_issue_ids": [],
         "escalation_signals": [],
     }
     atomic_write_json(layout.manifest(run_dir), manifest, overwrite=False)
@@ -173,9 +252,36 @@ def initialize_run(
 
 def update_manifest(run_dir: Path, **changes: Any) -> dict[str, Any]:
     manifest = read_json(layout.manifest(run_dir))
+    if "state" in changes:
+        transition_state(
+            manifest,
+            str(changes.pop("state")),
+            reason=str(changes.get("termination_reason") or "manifest update"),
+        )
     manifest.update(changes)
     atomic_write_json(layout.manifest(run_dir), manifest)
     return manifest
+
+
+def transition_state(
+    manifest: dict[str, Any],
+    state: str,
+    *,
+    reason: str | None = None,
+) -> None:
+    """상태를 바꾸면서 벤치마크가 읽을 수 있는 이력을 남긴다."""
+    previous = str(manifest.get("state") or "") or None
+    manifest["state"] = state
+    if previous == state:
+        return
+    manifest.setdefault("state_history", []).append(
+        {
+            "recorded_at": utc_now(),
+            "from": previous,
+            "to": state,
+            "reason": reason,
+        }
+    )
 
 
 def verified_request_hash(run_dir: Path) -> str:
@@ -267,6 +373,189 @@ def assert_run_can_advance(run_dir: Path, action: str) -> dict[str, Any]:
     return manifest
 
 
+def iterative_review_count(run_dir: Path, manifest: dict[str, Any] | None = None) -> int:
+    manifest = manifest or read_json(layout.manifest(run_dir))
+    value = (manifest.get("counters") or {}).get("iterative_reviews")
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return len(layout.iter_reviews(run_dir))
+
+
+def final_blind_attempt_count(run_dir: Path, manifest: dict[str, Any] | None = None) -> int:
+    manifest = manifest or read_json(layout.manifest(run_dir))
+    value = (manifest.get("counters") or {}).get("final_blind_attempts")
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    return len(layout.iter_blinds(run_dir))
+
+
+def assert_iterative_review_budget(run_dir: Path) -> dict[str, Any]:
+    manifest = read_json(layout.manifest(run_dir))
+    limit = int(
+        (manifest.get("limits") or {}).get(
+            "iterative_reviews",
+            (manifest.get("limits") or {}).get("review_rounds", DEFAULT_MAX_ROUNDS),
+        )
+    )
+    used = iterative_review_count(run_dir, manifest)
+    if used >= limit:
+        raise StateError(
+            "일반 검토 횟수 한도에 도달했습니다.",
+            details={"limit_kind": "ITERATIVE_REVIEWS", "used": used, "limit": limit},
+        )
+    return manifest
+
+
+def assert_final_blind_budget(run_dir: Path) -> dict[str, Any]:
+    manifest = read_json(layout.manifest(run_dir))
+    limit = int(
+        (manifest.get("limits") or {}).get(
+            "final_blind_attempts",
+            DEFAULT_MAX_FINAL_BLIND_ATTEMPTS,
+        )
+    )
+    used = final_blind_attempt_count(run_dir, manifest)
+    if used >= limit:
+        raise StateError(
+            "최종 독립 검토 횟수 한도에 도달했습니다.",
+            details={"limit_kind": "FINAL_BLIND_ATTEMPTS", "used": used, "limit": limit},
+        )
+    return manifest
+
+
+def assert_final_blind_ready(run_dir: Path) -> dict[str, Any]:
+    """현재 초안이 일반 검토를 통과했고 아직 독립 검토되지 않았는지 확인한다."""
+    manifest = read_json(layout.manifest(run_dir))
+    current_round = int(manifest.get("current_round", 0))
+    if (
+        manifest.get("state") != "APPROVED"
+        or manifest.get("last_review_verdict") != "APPROVED"
+        or int(manifest.get("last_reviewed_draft_round", -1)) != current_round
+    ):
+        raise StateError(
+            "마지막 새 검토는 현재 초안이 일반 검토를 통과한 뒤에만 실행할 수 있습니다.",
+            details={
+                "state": manifest.get("state"),
+                "current_draft_round": current_round,
+                "last_reviewed_draft_round": manifest.get("last_reviewed_draft_round"),
+                "last_review_verdict": manifest.get("last_review_verdict"),
+            },
+        )
+    registry = read_json(layout.registry(run_dir), default={})
+    open_gating = sorted(
+        issue_id
+        for issue_id, issue in registry.items()
+        if isinstance(issue, dict)
+        and issue.get("status") in OPEN_STATUSES
+        and issue.get("gating", True)
+    )
+    if open_gating:
+        raise StateError(
+            "해결되지 않은 문제가 있어 마지막 새 검토를 실행할 수 없습니다.",
+            details={"open_issue_ids": open_gating},
+        )
+    prior = layout.iter_blind_attempts(run_dir, current_round)
+    if prior:
+        raise StateError(
+            "같은 초안에는 마지막 새 검토를 한 번만 실행할 수 있습니다. "
+            "발견한 문제를 반영하고 일반 검토를 다시 통과시켜 주세요.",
+            details={
+                "draft_round": current_round,
+                "previous_attempts": [path.name for path in prior],
+                "next_command": "promote-final",
+            },
+        )
+    return manifest
+
+
+def assert_accept_risk_ready(run_dir: Path, issue_id: str) -> dict[str, Any]:
+    manifest = read_json(layout.manifest(run_dir))
+    pending = set(str(value) for value in manifest.get("pending_user_issue_ids", []))
+    if manifest.get("state") != "USER_DECISION_REQUIRED" or issue_id not in pending:
+        raise StateError(
+            "위험 수용은 사용자 결정이 필요한 상태에서 제시된 이슈에만 기록할 수 있습니다.",
+            details={
+                "state": manifest.get("state"),
+                "pending_user_issue_ids": sorted(pending),
+            },
+        )
+    return manifest
+
+
+def assert_provider_call_budget(run_dir: Path, *, needed: int = 1) -> dict[str, Any]:
+    manifest = read_json(layout.manifest(run_dir))
+    limit = int(
+        (manifest.get("limits") or {}).get(
+            "total_provider_calls",
+            DEFAULT_MAX_TOTAL_PROVIDER_CALLS,
+        )
+    )
+    used = len(
+        [item for item in (manifest.get("provider_calls") or []) if isinstance(item, dict)]
+    )
+    if used + needed > limit:
+        raise StateError(
+            "전체 provider 호출 한도를 넘을 수 없습니다.",
+            details={
+                "limit_kind": "TOTAL_PROVIDER_CALLS",
+                "used": used,
+                "needed": needed,
+                "limit": limit,
+            },
+        )
+    return manifest
+
+
+def record_final_blind_attempt(run_dir: Path) -> None:
+    manifest = read_json(layout.manifest(run_dir))
+    counters = manifest.setdefault("counters", {})
+    counters["final_blind_attempts"] = final_blind_attempt_count(run_dir, manifest) + 1
+    atomic_write_json(layout.manifest(run_dir), manifest)
+
+
+def record_promotion(run_dir: Path) -> None:
+    """승격은 검토 번호를 쓰지만 일반 검토 예산은 소비하지 않는다."""
+    manifest = read_json(layout.manifest(run_dir))
+    counters = manifest.setdefault("counters", {})
+    counters["promotions"] = int(counters.get("promotions", 0) or 0) + 1
+    counters["sequence_round"] = int(manifest.get("last_review_round", 0) or 0)
+    policy = manifest.setdefault(
+        "review_session_policy",
+        {
+            "reset_after_final_promotion": True,
+            "max_rounds_per_session": DEFAULT_REVIEW_SESSION_MAX_ROUNDS,
+            "epoch": 0,
+            "reset_count": 0,
+        },
+    )
+    if policy.get("reset_after_final_promotion", True):
+        _reset_review_session_in_manifest(manifest, reason="FINAL_BLIND_PROMOTION")
+    atomic_write_json(layout.manifest(run_dir), manifest)
+
+
+def _reset_review_session_in_manifest(manifest: dict[str, Any], *, reason: str) -> None:
+    policy = manifest.setdefault(
+        "review_session_policy",
+        {
+            "reset_after_final_promotion": True,
+            "max_rounds_per_session": DEFAULT_REVIEW_SESSION_MAX_ROUNDS,
+            "epoch": 0,
+            "reset_count": 0,
+        },
+    )
+    manifest["codex_review_session"] = None
+    policy["epoch"] = int(policy.get("epoch", 0) or 0) + 1
+    policy["reset_count"] = int(policy.get("reset_count", 0) or 0) + 1
+    policy["last_reset_reason"] = reason
+    policy["last_reset_at"] = utc_now()
+
+
+def reset_codex_review_session(run_dir: Path, *, reason: str) -> None:
+    manifest = read_json(layout.manifest(run_dir))
+    _reset_review_session_in_manifest(manifest, reason=reason)
+    atomic_write_json(layout.manifest(run_dir), manifest)
+
+
 def assert_source_unchanged(run_dir: Path) -> None:
     manifest = read_json(layout.manifest(run_dir))
     baseline = (manifest.get("environment") or {}).get("ensemble_source_hash")
@@ -275,7 +564,7 @@ def assert_source_unchanged(run_dir: Path) -> None:
     current = ensemble_source_hash()
     if current == baseline:
         return
-    manifest["state"] = "RUN_TAINTED"
+    transition_state(manifest, "RUN_TAINTED", reason="ensemble source changed")
     manifest["termination_reason"] = "Ensemble source changed after the run started"
     manifest["finished_at"] = utc_now()
     manifest.setdefault("environment_changes", []).append(
@@ -286,6 +575,179 @@ def assert_source_unchanged(run_dir: Path) -> None:
         "실행 중 Ensemble 코드가 바뀌었습니다. 결과가 섞이지 않도록 새 실행을 시작해 주세요.",
         details={"state": "RUN_TAINTED", "expected": baseline, "actual": current},
     )
+
+
+def empty_usage_totals() -> dict[str, int]:
+    """제공자 하나의 사용량 집계 초기값."""
+    totals = dict.fromkeys(USAGE_FIELDS, 0)
+    totals.update(
+        {
+            "calls_reported": 0,
+            "calls_unreported": 0,
+            "attempts_reported": 0,
+            "attempts_unreported": 0,
+        }
+    )
+    return totals
+
+
+def accumulate_usage(
+    manifest: dict[str, Any],
+    provider: str,
+    usage: Any,
+    *,
+    attempts: int = 1,
+    attempts_reported: int = 0,
+) -> None:
+    """제공자별 토큰 합계를 갱신한다.
+
+    `calls_*`는 논리 호출(run_codex/run_agy 1회) 수, `attempts_*`는 그 안의
+    재시도 1회 단위다. 사용량을 전혀 보고하지 않은 논리 호출은
+    `calls_unreported`로만 센다. 일부 시도만 보고된 호출은 `calls_reported`로
+    세면서 `attempts_unreported`가 올라가므로, 두 카운터 중 하나라도 0이
+    아니면 토큰 합계는 하한값이다.
+    """
+    totals = manifest.setdefault("usage", {}).setdefault(provider, empty_usage_totals())
+    for key, value in empty_usage_totals().items():
+        totals.setdefault(key, value)
+    attempts = max(int(attempts or 1), 1)
+    attempts_reported = max(min(int(attempts_reported or 0), attempts), 0)
+    totals["attempts_reported"] += attempts_reported
+    totals["attempts_unreported"] += attempts - attempts_reported
+    if not isinstance(usage, dict):
+        totals["calls_unreported"] += 1
+        return
+    for key in USAGE_FIELDS:
+        value = usage.get(key)
+        totals[key] += int(value) if isinstance(value, int) and not isinstance(value, bool) else 0
+    totals["calls_reported"] += 1
+
+
+def _normalized_usage(usage: Any) -> dict[str, int] | None:
+    if not isinstance(usage, dict):
+        return None
+    return {
+        key: (
+            int(usage.get(key))
+            if isinstance(usage.get(key), int) and not isinstance(usage.get(key), bool)
+            else 0
+        )
+        for key in USAGE_FIELDS
+    }
+
+
+def _attribute_usage_snapshot(
+    baselines: dict[str, Any],
+    provider: str,
+    usage: Any,
+    *,
+    usage_snapshots: Any = None,
+    fallback_session_id: Any = None,
+) -> tuple[dict[str, int] | None, bool]:
+    """누적 usage 스냅샷을 현재 논리 호출에서 늘어난 값으로 바꾼다.
+
+    반환값의 bool은 세션 차감이 적용됐는지 나타낸다. 세션 ID가 없는 값은
+    독립 호출로 보고 전체를 귀속한다.
+    """
+    records = [
+        item
+        for item in (usage_snapshots or [])
+        if isinstance(item, dict) and _normalized_usage(item.get("usage")) is not None
+    ]
+    normalized = _normalized_usage(usage)
+    if not records and normalized is not None and isinstance(fallback_session_id, str):
+        records = [{"session_id": fallback_session_id, "usage": normalized}]
+    if not records:
+        return normalized, False
+
+    provider_baselines = baselines.setdefault(provider, {})
+    attributed = dict.fromkeys(USAGE_FIELDS, 0)
+    used_session_delta = False
+    for record in records:
+        current = _normalized_usage(record.get("usage"))
+        if current is None:
+            continue
+        session_id = record.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            for key in USAGE_FIELDS:
+                attributed[key] += current[key]
+            continue
+
+        previous = provider_baselines.get(session_id)
+        if not isinstance(previous, dict):
+            delta = current
+        else:
+            prior = _normalized_usage(previous) or dict.fromkeys(USAGE_FIELDS, 0)
+            # 누적 카운터가 하나라도 감소하면 CLI 세션 통계가 재설정된 것으로
+            # 보고 새 스냅샷 전체를 귀속한다. 음수 토큰은 만들지 않는다.
+            reset = any(current[key] < prior[key] for key in USAGE_FIELDS)
+            delta = current if reset else {
+                key: current[key] - prior[key]
+                for key in USAGE_FIELDS
+            }
+        provider_baselines[session_id] = current
+        used_session_delta = True
+        for key in USAGE_FIELDS:
+            attributed[key] += delta[key]
+    return attributed, used_session_delta
+
+
+def _replay_provider_usage(
+    manifest: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """provider_calls를 시간순으로 재생해 세션 누적 중복을 제거한다."""
+    calls = [
+        event
+        for event in (manifest.get("provider_calls") or [])
+        if isinstance(event, dict)
+    ]
+    called_providers = {
+        str(event.get("provider") or "codex")
+        for event in calls
+    }
+    # provider_calls에 없는 작성자(Claude) 등의 별도 수집값은 그대로 보존한다.
+    usage = {
+        str(provider): dict(totals)
+        for provider, totals in (manifest.get("usage") or {}).items()
+        if isinstance(totals, dict) and str(provider) not in called_providers
+    }
+    baselines: dict[str, Any] = {}
+    holder: dict[str, Any] = {"usage": usage}
+    for event in calls:
+        provider = str(event.get("provider") or "codex")
+        attributed, _ = _attribute_usage_snapshot(
+            baselines,
+            provider,
+            event.get("usage"),
+            usage_snapshots=event.get("usage_snapshots"),
+            fallback_session_id=event.get("session_id"),
+        )
+        attempts = event.get("attempts")
+        accumulate_usage(
+            holder,
+            provider,
+            attributed,
+            attempts=int(attempts) if isinstance(attempts, int) else 1,
+            attempts_reported=int(event.get("attempts_reported", 0) or 0),
+        )
+    return holder["usage"], baselines
+
+
+def recompute_usage_from_provider_calls(manifest: dict[str, Any]) -> dict[str, Any]:
+    """구버전 실행도 provider_calls에서 세션 증가분 기준 사용량을 복원한다."""
+    usage, _ = _replay_provider_usage(manifest)
+    return usage
+
+
+def _ensure_usage_accounting_v2(manifest: dict[str, Any]) -> None:
+    """진행 중인 구버전 실행을 새 집계 방식으로 한 번만 올린다."""
+    if int(manifest.get("usage_accounting_version", 0) or 0) >= 2:
+        manifest.setdefault("usage_session_snapshots", {})
+        return
+    usage, baselines = _replay_provider_usage(manifest)
+    manifest["usage"] = usage
+    manifest["usage_session_snapshots"] = baselines
+    manifest["usage_accounting_version"] = 2
 
 
 def record_provider_call(
@@ -299,6 +761,7 @@ def record_provider_call(
     error: str | None = None,
 ) -> None:
     manifest = read_json(layout.manifest(run_dir))
+    _ensure_usage_accounting_v2(manifest)
     model = manifest.setdefault("models", {}).setdefault(provider, {})
     model["actual"] = result.model
     model["cli_version"] = result.version
@@ -319,10 +782,30 @@ def record_provider_call(
         "outcome": outcome,
         "session_id": getattr(result, "session_id", None),
         "session_resumed": bool(getattr(result, "session_resumed", False)),
+        "input_manifest": list(getattr(result, "input_manifest", ()) or ()),
+        "usage": getattr(result, "usage", None),
+        "usage_snapshots": list(getattr(result, "usage_snapshots", ()) or ()),
+        "attempts_reported": int(getattr(result, "attempts_reported", 0) or 0),
     }
+    attributed_usage, used_session_delta = _attribute_usage_snapshot(
+        manifest.setdefault("usage_session_snapshots", {}),
+        provider,
+        event["usage"],
+        usage_snapshots=event["usage_snapshots"],
+        fallback_session_id=event["session_id"],
+    )
+    event["usage_attributed"] = attributed_usage
+    event["usage_accounting"] = "session_delta" if used_session_delta else "standalone"
     if error:
         event["error"] = error
     manifest.setdefault("provider_calls", []).append(event)
+    accumulate_usage(
+        manifest,
+        provider,
+        attributed_usage,
+        attempts=int(result.attempts),
+        attempts_reported=int(getattr(result, "attempts_reported", 0) or 0),
+    )
     for attempt_error in result.attempt_errors:
         kind = "schema" if attempt_error.get("kind") == "schema" else "infra"
         manifest.setdefault("retries", {}).setdefault(kind, 0)
@@ -363,6 +846,7 @@ def record_provider_failure(
 ) -> None:
     provider = str(details.get("provider") or "codex")
     manifest = read_json(layout.manifest(run_dir))
+    _ensure_usage_accounting_v2(manifest)
     model = manifest.setdefault("models", {}).setdefault(provider, {})
     if details.get("model"):
         model["actual"] = details["model"]
@@ -372,26 +856,112 @@ def record_provider_failure(
         model["command_path"] = details["command_path"]
     if details.get("reasoning_effort"):
         model["reasoning_effort"] = details["reasoning_effort"]
-    manifest.setdefault("provider_calls", []).append(
-        {
-            "recorded_at": utc_now(),
-            "provider": provider,
-            "operation": operation,
-            "round": round_number,
-            "model": details.get("model"),
-            "cli_version": details.get("cli_version"),
-            "command_path": details.get("command_path"),
-            "reasoning_effort": details.get("reasoning_effort"),
-            "attempts": details.get("attempts"),
-            "attempt_errors": details.get("attempt_errors", []),
-            "outcome": "FAILED",
-            "error": error,
-        }
+    event = {
+        "recorded_at": utc_now(),
+        "provider": provider,
+        "operation": operation,
+        "round": round_number,
+        "model": details.get("model"),
+        "cli_version": details.get("cli_version"),
+        "command_path": details.get("command_path"),
+        "reasoning_effort": details.get("reasoning_effort"),
+        "attempts": details.get("attempts"),
+        "attempt_errors": details.get("attempt_errors", []),
+        "input_manifest": details.get("input_manifest", []),
+        "outcome": "FAILED",
+        "error": error,
+        "session_id": details.get("session_id"),
+        "session_resumed": bool(details.get("session_id") and details.get("persist_session")),
+        "usage": details.get("usage"),
+        "usage_snapshots": details.get("usage_snapshots", []),
+        "attempts_reported": int(details.get("attempts_reported", 0) or 0),
+    }
+    attributed_usage, used_session_delta = _attribute_usage_snapshot(
+        manifest.setdefault("usage_session_snapshots", {}),
+        provider,
+        event["usage"],
+        usage_snapshots=event["usage_snapshots"],
+        fallback_session_id=event["session_id"],
+    )
+    event["usage_attributed"] = attributed_usage
+    event["usage_accounting"] = "session_delta" if used_session_delta else "standalone"
+    manifest.setdefault("provider_calls", []).append(event)
+    # Codex가 실패 시도에도 usage 이벤트를 남기면 합산하고, 보고되지 않은
+    # 시도만 하한으로 표시한다. Agy는 현재 사용량 보고 수단이 없다.
+    attempts = details.get("attempts")
+    accumulate_usage(
+        manifest,
+        provider,
+        attributed_usage,
+        attempts=int(attempts) if isinstance(attempts, int) else 1,
+        attempts_reported=int(details.get("attempts_reported", 0) or 0),
     )
     atomic_write_json(layout.manifest(run_dir), manifest)
 
 
-def resolve_user_decision(run_dir: Path, *, action: str, note: str) -> dict[str, Any]:
+def _record_authoritative_decisions(
+    run_dir: Path,
+    decisions: list[dict[str, Any]],
+) -> list[str]:
+    projection = read_json(
+        layout.user_decisions(run_dir),
+        default={"schema_version": 1, "decisions": []},
+    )
+    records = projection.setdefault("decisions", [])
+    if not isinstance(records, list):
+        raise StateError("user-decisions.json의 decisions가 배열이 아닙니다.")
+    known = {
+        str(record.get("decision_id")): record
+        for record in records
+        if isinstance(record, dict) and record.get("decision_id")
+    }
+    created: list[str] = []
+    for value in decisions:
+        if not isinstance(value, dict) or set(value) != {"decision", "supersedes"}:
+            raise InputError(
+                "authoritative_decisions 항목은 decision과 supersedes만 가져야 합니다."
+            )
+        decision = value.get("decision")
+        supersedes = value.get("supersedes")
+        if not isinstance(decision, str) or not decision.strip():
+            raise InputError("권위 사용자 결정의 decision이 비어 있습니다.")
+        if (
+            not isinstance(supersedes, list)
+            or not all(isinstance(item, str) and item.strip() for item in supersedes)
+        ):
+            raise InputError("권위 사용자 결정의 supersedes는 결정 ID 문자열 배열이어야 합니다.")
+        unknown = sorted(set(supersedes) - set(known))
+        if unknown:
+            raise InputError(
+                "존재하지 않는 사용자 결정을 supersedes로 지정했습니다.",
+                details={"unknown_decision_ids": unknown},
+            )
+        for decision_id in supersedes:
+            known[decision_id]["active"] = False
+            known[decision_id]["superseded_at"] = utc_now()
+        decision_id = f"UD-{len(records) + 1:03d}"
+        record = {
+            "decision_id": decision_id,
+            "source": "USER",
+            "decision": decision.strip(),
+            "supersedes": list(supersedes),
+            "active": True,
+            "recorded_at": utc_now(),
+        }
+        records.append(record)
+        known[decision_id] = record
+        created.append(decision_id)
+    atomic_write_json(layout.user_decisions(run_dir), projection)
+    return created
+
+
+def resolve_user_decision(
+    run_dir: Path,
+    *,
+    action: str,
+    note: str,
+    authoritative_decisions: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     manifest = read_json(layout.manifest(run_dir))
     from_state = str(manifest.get("state"))
     if from_state not in PAUSED_STATES:
@@ -400,6 +970,23 @@ def resolve_user_decision(run_dir: Path, *, action: str, note: str) -> dict[str,
         raise InputError("재개 방식은 REVISE 또는 CONTINUE여야 합니다.")
     if not note.strip():
         raise InputError("사용자 결정 메모가 비어 있습니다.")
+    if manifest.get("benchmark"):
+        raise StateError(
+            "벤치마크 실행은 사용자 개입 상태에서 재개할 수 없습니다. "
+            "정지 상태 자체를 채점하고 다음 케이스로 진행해 주세요.",
+            details={
+                "state": from_state,
+                "benchmark_case_completed": True,
+                "case_id": (manifest.get("benchmark") or {}).get("case_id"),
+            },
+        )
+    created_decision_ids = _record_authoritative_decisions(
+        run_dir,
+        authoritative_decisions or [],
+    )
+    manifest["user_decisions_hash"] = sha256_text(
+        layout.user_decisions(run_dir).read_text(encoding="utf-8")
+    )
     event = {
         "recorded_at": utc_now(),
         "from_state": from_state,
@@ -407,9 +994,10 @@ def resolve_user_decision(run_dir: Path, *, action: str, note: str) -> dict[str,
         "note": note.strip(),
         "signals": manifest.get("escalation_signals", []),
         "pending_issue_ids": manifest.get("pending_user_issue_ids", []),
+        "authoritative_decision_ids": created_decision_ids,
     }
     manifest.setdefault("user_decisions", []).append(event)
-    manifest["state"] = "DRAFT_READY"
+    transition_state(manifest, "DRAFT_READY", reason="user decision recorded")
     manifest["escalation_signals"] = []
     manifest["pending_user_issue_ids"] = []
     manifest["pending_panel_issue_ids"] = []
@@ -421,6 +1009,7 @@ def resolve_user_decision(run_dir: Path, *, action: str, note: str) -> dict[str,
         f"- 이전 상태: {from_state}\n"
         f"- 결정: {action}\n"
         f"- 메모: {note.strip()}\n"
+        f"- 권위 결정 ID: {', '.join(created_decision_ids) if created_decision_ids else '없음'}\n"
     )
     atomic_write_text(decisions_path, existing + section)
     return event
@@ -435,6 +1024,18 @@ def add_manifest_warning(run_dir: Path, warning: str) -> None:
 
 def register_draft(run_dir: Path, source: Path, round_number: int) -> dict[str, Any]:
     assert_run_can_advance(run_dir, "save draft")
+    manifest = read_json(layout.manifest(run_dir))
+    repair_required = sorted(
+        str(value) for value in (manifest.get("repair_plan_required_issue_ids") or [])
+    )
+    if repair_required:
+        raise StateError(
+            "같은 문제가 수정 후 다시 발견되어 근본 수정 계획이 필요합니다.",
+            details={
+                "issue_ids": repair_required,
+                "next_command": "repair-plan",
+            },
+        )
     if round_number < 0:
         raise InputError("초안 번호는 0 이상이어야 합니다.")
     destination = layout.draft(run_dir, round_number)
@@ -452,7 +1053,11 @@ def register_draft(run_dir: Path, source: Path, round_number: int) -> dict[str, 
     oscillation = record_draft_oscillation(run_dir, round_number, hashes)
     manifest = read_json(layout.manifest(run_dir))
     manifest["current_round"] = max(int(manifest.get("current_round", 0)), round_number)
-    manifest["state"] = "OSCILLATING" if oscillation["terminate"] else "DRAFT_READY"
+    transition_state(
+        manifest,
+        "OSCILLATING" if oscillation["terminate"] else "DRAFT_READY",
+        reason="draft registered",
+    )
     if oscillation["terminate"]:
         manifest["termination_reason"] = "The same section oscillated for the second time"
         manifest["finished_at"] = utc_now()
@@ -463,6 +1068,63 @@ def register_draft(run_dir: Path, source: Path, round_number: int) -> dict[str, 
         "invalidated_accepted_risks": invalidated,
         "oscillation": oscillation,
     }
+
+
+def record_repair_plan(
+    run_dir: Path,
+    *,
+    issue_id: str,
+    round_number: int,
+    plan: dict[str, Any],
+) -> dict[str, Any]:
+    required_fields = {
+        "root_cause",
+        "invariant",
+        "counterexample",
+        "state_model",
+        "verification_steps",
+    }
+    if set(plan) != required_fields:
+        raise InputError(
+            "근본 수정 계획 필드가 올바르지 않습니다.",
+            details={
+                "missing": sorted(required_fields - set(plan)),
+                "unknown": sorted(set(plan) - required_fields),
+            },
+        )
+    for field in required_fields - {"verification_steps"}:
+        value = plan.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise InputError(f"근본 수정 계획의 {field}가 비어 있습니다.")
+    steps = plan.get("verification_steps")
+    if (
+        not isinstance(steps, list)
+        or not steps
+        or not all(isinstance(step, str) and step.strip() for step in steps)
+    ):
+        raise InputError("verification_steps는 비어 있지 않은 문자열 배열이어야 합니다.")
+    manifest = read_json(layout.manifest(run_dir))
+    pending = set(str(value) for value in manifest.get("repair_plan_required_issue_ids") or [])
+    if issue_id not in pending:
+        raise StateError(f"현재 근본 수정 계획이 필요한 이슈가 아닙니다: {issue_id}")
+    registry = read_json(layout.registry(run_dir), default={})
+    if issue_id not in registry:
+        raise InputError(f"존재하지 않는 이슈 ID입니다: {issue_id}")
+    record = {
+        "issue_id": issue_id,
+        "round": round_number,
+        "recorded_at": utc_now(),
+        **plan,
+    }
+    atomic_write_json(
+        layout.repair_plan(run_dir, issue_id, round_number),
+        record,
+        overwrite=False,
+    )
+    pending.remove(issue_id)
+    manifest["repair_plan_required_issue_ids"] = sorted(pending)
+    atomic_write_json(layout.manifest(run_dir), manifest)
+    return record
 
 
 def invalidate_accepted_risks(run_dir: Path, markdown: str, round_number: int) -> list[str]:

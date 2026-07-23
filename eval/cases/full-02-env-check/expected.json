@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "review_required": "이 정답지는 사용자가 검토해야 채점에 사용할 수 있습니다.",
+  "reviewed_by_user": true,
+  "case_type": "quality",
+  "suites": ["full"],
+  "tags": ["cli", "developer-tool", "security-constraint", "scope-creep"],
+  "difficulty": "medium",
+  "expected_terminal_states": ["USER_DECISION_REQUIRED"],
+  "forbidden_states": ["ITERATION_LIMIT_REACHED", "OSCILLATING", "PROTOTYPE_INCOMPLETE"],
+  "expect_user_decision": true,
+  "expect_escalation": false,
+  "notes": "CLI 기본 경로·지원 범위·파싱 규칙은 원문만으로 확정할 수 없어 사용자 결정 지점에서 멈추는 것이 정답입니다.",
+  "quality_expectations": {
+    "must_cover": [
+      ".env.example에는 있으나 .env에는 없는 키를 찾아 보고하는 규칙",
+      ".env에 있으나 값이 비어 있는 키를 찾아 보고하는 규칙",
+      ".env에만 있고 .env.example에는 없는 키를 찾아 보고하는 규칙",
+      "CI에서 검사 성공과 실패를 판별할 수 있는 방식",
+      "어떤 경우에도 환경 변수의 값 자체를 출력하지 않는다는 제약",
+      "표준 라이브러리만 사용한다는 제약"
+    ],
+    "must_not_assert": [
+      ".env와 .env.example 파일의 위치를 지정하는 방식과 기본 경로",
+      "여러 환경별 파일(.env.staging 등)이나 여러 파일을 한 번에 검사하는 기능",
+      "빠진 키를 자동으로 채우거나 .env 파일을 고쳐 주는 기능",
+      "주석, 빈 줄, 따옴표로 감싼 값의 파싱 규칙",
+      "결과를 기계가 읽을 수 있는 형식(JSON 등)으로 내보내는 기능"
+    ]
+  }
+}

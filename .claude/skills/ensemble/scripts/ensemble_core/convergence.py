@@ -6,6 +6,7 @@ from typing import Any
 
 from .config import OPEN_STATUSES
 from .io_utils import atomic_write_json, read_json, utc_now
+from .state_machine import reset_codex_review_session, transition_state
 from .registry import load_registry
 from . import layout
 
@@ -97,6 +98,26 @@ def _author_deadlocks(registry: dict[str, Any]) -> list[str]:
     return deadlocks
 
 
+def _failed_fixes(registry: dict[str, Any]) -> list[str]:
+    """수정 수용 뒤에도 같은 이슈가 다음 검토에서 그대로 남은 경우."""
+    failed: list[str] = []
+    for issue_id, issue in registry.items():
+        if issue.get("status") not in OPEN_STATUSES:
+            continue
+        history = issue.get("author_disposition_history") or []
+        if len(history) < 2:
+            continue
+        previous, current = history[-2:]
+        if (
+            previous.get("value") == "ACCEPT"
+            and current.get("value") == "ACCEPT"
+            and int(current.get("round", -10)) == int(previous.get("round", -10)) + 1
+            and int(issue.get("last_seen_round", -20)) == int(current.get("round", -10))
+        ):
+            failed.append(issue_id)
+    return failed
+
+
 def record_review_metrics(run_dir: Path, *, round_number: int, stats: dict[str, Any]) -> dict[str, Any]:
     registry = load_registry(run_dir)
     convergence = read_json(layout.convergence(run_dir), default={"rounds": [], "events": []})
@@ -143,34 +164,67 @@ def refresh_author_dispositions(run_dir: Path, round_number: int) -> None:
             record["author_dispositions"] = _latest_author_dispositions(registry)
     _recompute_stall(convergence["rounds"])
     deadlocks = _author_deadlocks(registry)
+    failed_fixes = _failed_fixes(registry)
     current = next((record for record in convergence["rounds"] if record.get("round") == round_number), None)
     signals: list[dict[str, Any]] = []
     for issue_id in deadlocks:
         signals.append({"type": "AUTHOR_DEADLOCK", "issue_id": issue_id, "round": round_number})
+    for issue_id in failed_fixes:
+        signals.append({"type": "FAILED_FIX", "issue_id": issue_id, "round": round_number})
     if current and current.get("reviewer_storm"):
         signals.append({"type": "REVIEWER_STORM", "round": round_number})
     existing = {
         (event.get("type"), event.get("issue_id"), event.get("round"))
         for event in convergence["events"]
     }
+    new_signals: list[dict[str, Any]] = []
     for signal in signals:
         key = (signal.get("type"), signal.get("issue_id"), signal.get("round"))
         if key not in existing:
-            convergence["events"].append({**signal, "recorded_at": utc_now()})
+            recorded = {**signal, "recorded_at": utc_now()}
+            convergence["events"].append(recorded)
+            new_signals.append(recorded)
     atomic_write_json(layout.convergence(run_dir), convergence)
-    if signals:
+    pause_signals = [
+        signal for signal in signals if signal.get("type") in {"AUTHOR_DEADLOCK", "REVIEWER_STORM"}
+    ]
+    failed_issue_ids = sorted(
+        str(signal["issue_id"])
+        for signal in new_signals
+        if signal.get("type") == "FAILED_FIX" and signal.get("issue_id")
+    )
+    if pause_signals or failed_issue_ids:
         manifest = read_json(layout.manifest(run_dir))
-        phase_three = str(manifest.get("phase")) == "3"
-        manifest["state"] = "ESCALATION_REQUIRED" if phase_three else "USER_DECISION_REQUIRED"
-        manifest["escalation_signals"] = signals
-        if phase_three:
-            pending = set(manifest.get("pending_panel_issue_ids", []))
-            pending.update(
-                str(signal["issue_id"])
-                for signal in signals
-                if signal.get("type") == "AUTHOR_DEADLOCK" and signal.get("issue_id")
+        if failed_issue_ids:
+            pending_repairs = set(manifest.get("repair_plan_required_issue_ids") or [])
+            pending_repairs.update(failed_issue_ids)
+            manifest["repair_plan_required_issue_ids"] = sorted(pending_repairs)
+            atomic_write_json(layout.manifest(run_dir), manifest)
+            reset_codex_review_session(run_dir, reason="FAILED_FIX")
+            manifest = read_json(layout.manifest(run_dir))
+        if pause_signals:
+            phase_three = str(manifest.get("phase")) == "3"
+            transition_state(
+                manifest,
+                "ESCALATION_REQUIRED" if phase_three else "USER_DECISION_REQUIRED",
+                reason="convergence escalation signal",
             )
-            manifest["pending_panel_issue_ids"] = sorted(pending)
+            manifest["escalation_signals"] = pause_signals
+            pending_user = set(manifest.get("pending_user_issue_ids", []))
+            pending_user.update(
+                str(signal["issue_id"])
+                for signal in pause_signals
+                if signal.get("issue_id")
+            )
+            manifest["pending_user_issue_ids"] = sorted(pending_user)
+            if phase_three:
+                pending = set(manifest.get("pending_panel_issue_ids", []))
+                pending.update(
+                    str(signal["issue_id"])
+                    for signal in pause_signals
+                    if signal.get("type") == "AUTHOR_DEADLOCK" and signal.get("issue_id")
+                )
+                manifest["pending_panel_issue_ids"] = sorted(pending)
         atomic_write_json(layout.manifest(run_dir), manifest)
 
 

@@ -160,13 +160,20 @@ def find_consumed_request_hash(request_hash: str) -> list[str]:
     matches: list[str] = []
     if not RUNS_ROOT.exists():
         return matches
-    for manifest_path in RUNS_ROOT.glob("*/manifest.json"):
+    # v1은 루트에, v2(layout)는 _state/에 manifest를 둔다. 둘 다 본다.
+    manifest_paths = list(RUNS_ROOT.glob("*/manifest.json")) + list(
+        RUNS_ROOT.glob("*/_state/manifest.json")
+    )
+    for manifest_path in manifest_paths:
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             continue
         if manifest.get("request_hash") == request_hash:
-            matches.append(str(manifest_path.parent))
+            run_dir = manifest_path.parent
+            if run_dir.name == "_state":
+                run_dir = run_dir.parent
+            matches.append(str(run_dir))
     return sorted(matches)
 
 

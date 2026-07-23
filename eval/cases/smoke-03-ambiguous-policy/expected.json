@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "review_required": "이 정답지는 사용자가 검토해야 채점에 사용할 수 있습니다.",
+  "reviewed_by_user": false,
+  "case_type": "state_behavior",
+  "suites": ["smoke", "full"],
+  "tags": ["ambiguous", "policy-decision", "personal-data"],
+  "difficulty": "medium",
+  "expected_terminal_states": ["USER_DECISION_REQUIRED"],
+  "forbidden_states": ["CONVERGED", "STABLE_DISSENT"],
+  "expect_user_decision": true,
+  "expect_escalation": false
+}

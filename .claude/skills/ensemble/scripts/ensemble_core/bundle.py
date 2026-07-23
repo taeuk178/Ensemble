@@ -12,12 +12,14 @@ from .config import (
     AUDIT_BUNDLE_ALLOWLIST,
     FINAL_BUNDLE_ALLOWLIST,
     FORBIDDEN_REVIEW_FILES,
+    JUDGE_BUNDLE_ALLOWLIST,
+    JUDGE_EXPECTATIONS_BUNDLE_ALLOWLIST,
     PANEL_BUNDLE_ALLOWLIST,
     PROPOSAL_BUNDLE_ALLOWLIST,
     REVIEW_BUNDLE_ALLOWLIST,
 )
 from .errors import SecurityError, StateError
-from .io_utils import atomic_write_json, ensure_within
+from .io_utils import atomic_write_json, ensure_within, read_json, sha256_text
 from . import layout
 
 
@@ -27,6 +29,8 @@ MODE_ALLOWLISTS = {
     "final": FINAL_BUNDLE_ALLOWLIST,
     "panel": PANEL_BUNDLE_ALLOWLIST,
     "audit": AUDIT_BUNDLE_ALLOWLIST,
+    "judge": JUDGE_BUNDLE_ALLOWLIST,
+    "judge-expectations": JUDGE_EXPECTATIONS_BUNDLE_ALLOWLIST,
 }
 
 
@@ -35,6 +39,26 @@ def _copy_checked(source: Path, destination: Path, run_dir: Path) -> None:
     if not resolved.is_file() or resolved.is_symlink():
         raise SecurityError(f"Bundle source must be a regular non-symlink file: {source}")
     shutil.copyfile(resolved, destination)
+
+
+def _copy_user_decisions(run_dir: Path, destination: Path) -> None:
+    """구버전 실행에는 projection이 없으므로 빈 권위 입력으로 읽는다."""
+    source = layout.user_decisions(run_dir)
+    if source.exists():
+        manifest = read_json(layout.manifest(run_dir), default={})
+        expected_hash = manifest.get("user_decisions_hash")
+        actual_hash = sha256_text(source.read_text(encoding="utf-8"))
+        if expected_hash and actual_hash != expected_hash:
+            raise StateError(
+                "user-decisions.json이 사용자 결정 명령 밖에서 변경되었습니다. "
+                "resolve-user-decision으로만 권위 결정을 기록해 주세요."
+            )
+        _copy_checked(source, destination, run_dir)
+        return
+    destination.write_text(
+        json.dumps({"schema_version": 1, "decisions": []}, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 def prepare_review_session_bundle(
@@ -72,6 +96,8 @@ def prepare_review_session_bundle(
     }
     for name, source in sources.items():
         _copy_checked(source, bundle_dir / name, run_dir)
+    _copy_user_decisions(run_dir, bundle_dir / "user-decisions.json")
+    sources["user-decisions.json"] = layout.user_decisions(run_dir)
     audit_path = layout.bundles_dir(run_dir) / f"{uuid.uuid4().hex}.json"
     atomic_write_json(
         audit_path,
@@ -94,6 +120,8 @@ def isolated_bundle(
     issue: dict[str, object] | None = None,
     previous_draft_path: Path | None = None,
     audit_issues: list[dict[str, object]] | None = None,
+    inline_documents: dict[str, str] | None = None,
+    expectations: dict[str, object] | None = None,
 ) -> Iterator[Path]:
     if mode not in MODE_ALLOWLISTS:
         raise StateError(f"알 수 없는 입력 묶음 종류입니다: {mode}")
@@ -102,6 +130,8 @@ def isolated_bundle(
         bundle_dir = Path(temporary)
         _copy_checked(layout.request(run_dir), bundle_dir / "request.md", run_dir)
         _copy_checked(layout.rubric(run_dir), bundle_dir / "rubric.md", run_dir)
+        if mode != "proposal":
+            _copy_user_decisions(run_dir, bundle_dir / "user-decisions.json")
         if draft_path is not None:
             _copy_checked(draft_path, bundle_dir / "draft.md", run_dir)
         if mode == "review":
@@ -124,6 +154,19 @@ def isolated_bundle(
             (bundle_dir / "new-issues.json").write_text(
                 json.dumps(audit_issues, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
             )
+        # 심판은 어느 쪽이 최종본인지 드러나지 않는 중립 파일명이 필요하므로
+        # 원본 경로 복사 대신 document-N 이름으로 내용을 직접 쓴다.
+        for name, text in (inline_documents or {}).items():
+            (bundle_dir / name).write_text(text, encoding="utf-8")
+        if mode.startswith("judge"):
+            if not inline_documents:
+                raise StateError("심판 입력에는 비교할 문서가 필요합니다.")
+            if mode == "judge-expectations":
+                if expectations is None:
+                    raise StateError("기대 결과 채점에는 케이스 정답지가 필요합니다.")
+                (bundle_dir / "expectations.json").write_text(
+                    json.dumps(expectations, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+                )
         names = {path.name for path in bundle_dir.iterdir()}
         if names - allowlist:
             raise SecurityError(f"Bundle contains non-whitelisted files: {sorted(names - allowlist)}")

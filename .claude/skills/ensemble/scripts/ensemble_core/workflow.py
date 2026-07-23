@@ -16,11 +16,17 @@ from .providers import ProviderResult, run_codex
 from .registry import apply_review, load_registry
 from .state_machine import assert_run_can_advance, register_draft
 from .state_machine import (
+    assert_iterative_review_budget,
+    assert_final_blind_budget,
+    assert_provider_call_budget,
     load_codex_review_session,
+    record_promotion,
     record_codex_review_session,
     record_provider_call,
     record_retry_event,
+    reset_codex_review_session,
     verified_request_hash,
+    transition_state,
 )
 from .validation import validate_against_schema, validate_review_semantics
 from . import layout
@@ -89,7 +95,13 @@ def save_proposal(run_dir: Path, proposal: dict[str, Any]) -> Path:
     path = layout.proposal(run_dir, "gpt.json")
     atomic_write_json(path, proposal, overwrite=False)
     manifest = read_json(layout.manifest(run_dir))
-    manifest["state"] = "PROPOSALS_READY" if (layout.proposal(run_dir, "claude.md")).exists() else "GPT_PROPOSAL_READY"
+    transition_state(
+        manifest,
+        "PROPOSALS_READY"
+        if (layout.proposal(run_dir, "claude.md")).exists()
+        else "GPT_PROPOSAL_READY",
+        reason="GPT proposal saved",
+    )
     atomic_write_json(layout.manifest(run_dir), manifest)
     return path
 
@@ -118,6 +130,7 @@ def _validate_and_apply_review(
     baseline_draft_round: int,
     output_path: Path,
     allow_rebuttal_similarity: bool = False,
+    counts_as_iterative: bool = True,
 ) -> dict[str, Any]:
     schema_path = REFERENCE_ROOT / "review.schema.json"
     validate_against_schema(review, schema_path, "review")
@@ -151,7 +164,16 @@ def _validate_and_apply_review(
     manifest["last_review_round"] = review_round
     manifest["last_reviewed_draft_round"] = draft_round
     manifest["last_review_verdict"] = review["verdict"]
-    manifest["state"] = review["verdict"]
+    transition_state(manifest, review["verdict"], reason=f"review {review_round} applied")
+    pending_user: set[str] = set()
+    for position, finding in enumerate(review["blocking_issues"]):
+        if finding.get("decision_owner") != "USER":
+            continue
+        issue_id = finding.get("id") or stats["assigned_ids"].get(str(position))
+        if issue_id:
+            pending_user.add(str(issue_id))
+    if review["verdict"] == "USER_DECISION_REQUIRED":
+        manifest["pending_user_issue_ids"] = sorted(pending_user)
     history = [
         item
         for item in manifest.get("review_history", [])
@@ -166,6 +188,10 @@ def _validate_and_apply_review(
         }
     )
     manifest["review_history"] = sorted(history, key=lambda item: int(item["review_round"]))
+    counters = manifest.setdefault("counters", {})
+    counters["sequence_round"] = review_round
+    if counts_as_iterative:
+        counters["iterative_reviews"] = int(counters.get("iterative_reviews", 0) or 0) + 1
     atomic_write_json(layout.manifest(run_dir), manifest)
     return {"review": str(output_path), "verdict": review["verdict"], "stats": stats, "metrics": metrics}
 
@@ -179,6 +205,7 @@ def ingest_review(
     allow_rebuttal_similarity: bool = False,
 ) -> dict[str, Any]:
     assert_run_can_advance(run_dir, "review")
+    assert_iterative_review_budget(run_dir)
     manifest = read_json(layout.manifest(run_dir))
     expected_review_round = int(manifest.get("last_review_round", 0)) + 1
     if review_round != expected_review_round:
@@ -212,6 +239,7 @@ def run_review(
     semantic_retries: int = 2,
 ) -> tuple[ProviderResult, dict[str, Any]]:
     assert_run_can_advance(run_dir, "review")
+    assert_iterative_review_budget(run_dir)
     manifest = read_json(layout.manifest(run_dir))
     expected_review_round = int(manifest.get("last_review_round", 0)) + 1
     if review_round != expected_review_round:
@@ -230,6 +258,13 @@ def run_review(
     last_error: SemanticValidationError | SchemaError | None = None
     request_hash = verified_request_hash(run_dir)
     review_session = load_codex_review_session(run_dir)
+    if review_session:
+        policy = manifest.get("review_session_policy") or {}
+        max_rounds = int(policy.get("max_rounds_per_session", 3) or 3)
+        first_round = int(review_session.get("first_review_round", review_round))
+        if review_round - first_round >= max_rounds:
+            reset_codex_review_session(run_dir, reason="PERIODIC_ROUND_LIMIT")
+            review_session = None
     session_id = review_session["session_id"] if review_session else None
     bundle_dir = prepare_review_session_bundle(
         run_dir,
@@ -237,6 +272,7 @@ def run_review(
         request_hash=request_hash,
     )
     for semantic_attempt in range(semantic_retries + 1):
+        assert_provider_call_budget(run_dir)
         result = run_codex(
             bundle_dir=bundle_dir,
             prompt=prompt,
@@ -314,30 +350,43 @@ def run_review(
 
 def promote_final_findings(run_dir: Path) -> dict[str, Any]:
     assert_run_can_advance(run_dir, "promote-final")
+    # 승격 뒤에는 작성자 수정과 일반 검토, 그리고 새 독립 검토가 모두
+    # 가능해야 한다. 남은 예산이 없으면 미수용 발견으로 종료한다.
+    assert_iterative_review_budget(run_dir)
+    assert_final_blind_budget(run_dir)
     reconciliation = read_json(layout.final_reconciliation(run_dir), default={})
     findings = reconciliation.get("unaccepted_blocking_findings", [])
     if not findings:
         raise StateError("There are no unaccepted FINAL_BLIND findings to promote")
     manifest = read_json(layout.manifest(run_dir))
-    if int(manifest.get("last_review_round", 0)) >= int(manifest["limits"]["review_rounds"]):
-        raise StateError("Cannot promote FINAL_BLIND findings after the review round limit")
     draft_round, _ = current_draft(run_dir)
     review_round = int(manifest.get("last_review_round", 0)) + 1
     baseline_draft_round = int(manifest.get("last_reviewed_draft_round", -1))
+    user_owned = [
+        record["finding"]
+        for record in findings
+        if (record.get("finding") or {}).get("decision_owner") == "USER"
+    ]
     review = {
-        "verdict": "NEEDS_REVISION",
+        "verdict": "USER_DECISION_REQUIRED" if user_owned else "NEEDS_REVISION",
         "summary": "최종 독립 검토에서 새로운 미수용 이슈가 발견되어 일반 검토로 돌아갑니다.",
         "blocking_issues": [record["finding"] for record in findings],
         "resolved_issues": [],
-        "questions_for_user": [],
+        "questions_for_user": [
+            str(finding.get("required_change") or finding.get("problem"))
+            for finding in user_owned
+        ],
         "nonblocking_risks": [],
     }
     output_path = layout.promoted(run_dir, review_round)
-    return _validate_and_apply_review(
+    applied = _validate_and_apply_review(
         run_dir,
         review=review,
         review_round=review_round,
         draft_round=draft_round,
         baseline_draft_round=baseline_draft_round,
         output_path=output_path,
+        counts_as_iterative=False,
     )
+    record_promotion(run_dir)
+    return applied

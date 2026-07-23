@@ -69,6 +69,9 @@ Claude가 명세를 작성하고 GPT가 독립적으로 검토한다. `review.py
    `--round`는 검토 번호다. 초안 번호와 같다고 가정하지 않는다. 특정 초안을 검토할 때만 `--draft-round <N>`을 쓴다.
 
    일반 검토는 같은 실행의 같은 요청에서 Codex 세션을 이어 쓴다. 첫 검토에서 만든 세션 ID는 요청 해시와 실행 ID에 묶어 `manifest.json`에 기록한다. 이후 검토는 이 세션을 재개하며, 둘 중 하나라도 다르면 재사용하지 않는다. 제안, 추가 판단, 이슈 점검, 최종 독립 검토에는 이 세션을 쓰지 않는다.
+   한 세션은 최대 3개 일반 검토까지만 이어 쓰고 이후에는 이슈 projection을
+   바탕으로 새 세션을 시작한다. 첫 검토는 API 계약, 날짜·시간대 경계, 데이터
+   연결, 캐시 수명, 실패·재시도, 개인정보 경계를 포함해 문서 전체를 점검한다.
 
 6. 결과가 `NEEDS_REVISION`이면 모든 이슈에 `ACCEPT`(수용), `REJECT`(반박), `DEFER`(보류) 중 하나를 기록한다. 수용한 이슈는 문서에 반영하고 다음 번호의 초안으로 저장한다. 반박만 했다면 초안을 복사하지 않는다. 자유 서술은 셸 인자가 아닌 JSON 파일로 전달한다.
 
@@ -90,13 +93,36 @@ Claude가 명세를 작성하고 GPT가 독립적으로 검토한다. `review.py
    python3 .claude/skills/ensemble/scripts/review.py decision --run <run> --input <decision.json>
    ```
 
+   같은 이슈를 수정했는데 다음 검토에서도 다시 수용하게 되면 작은 패치를
+   반복하지 않는다. 명령 결과의 `repair_plan_required_issue_ids`를 확인하고
+   아래 계획을 먼저 기록한다.
+
+   ```json
+   {
+     "root_cause": "근본 원인",
+     "invariant": "항상 지켜야 하는 조건",
+     "counterexample": "현재 설계가 실패하는 구체적 예",
+     "state_model": "필요한 상태·데이터·전이",
+     "verification_steps": ["검증 예시 1", "검증 예시 2"]
+   }
+   ```
+
+   ```bash
+   python3 .claude/skills/ensemble/scripts/review.py repair-plan \
+     --run <run> --issue <id> --round <N> --input <repair-plan.json>
+   ```
+
 7. 결과가 `APPROVED`이면 이전 검토 이력을 숨긴 최종 독립 검토(`FINAL_BLIND`)를 실행한다.
 
    ```bash
    python3 .claude/skills/ensemble/scripts/review.py final-blind --run <run>
    ```
 
-   새로 발견된 진행 차단 이슈가 있으면 등록하고 일반 검토로 돌아간다.
+   현재 초안의 일반 검토 결과가 `APPROVED`일 때만 실행한다. 같은 초안에는
+   한 번만 실행한다. 새로 발견된 진행 차단 이슈가 있으면 등록하고 일반
+   검토로 돌아간 뒤, 수정 초안을 다시 승인받아야 다음 최종 검토를 실행한다.
+   승격은 일반 검토 횟수를 소비하지 않지만, 확증 편향을 줄이기 위해 기존
+   Codex 검토 세션을 닫고 다음 일반 검토에서 새 세션을 시작한다.
 
    ```bash
    python3 .claude/skills/ensemble/scripts/review.py promote-final --run <run>
@@ -108,21 +134,42 @@ Claude가 명세를 작성하고 GPT가 독립적으로 검토한다. `review.py
    python3 .claude/skills/ensemble/scripts/review.py finalize --run <run> --status auto
    ```
 
-9. 매 명령의 `state`를 확인한다. `USER_DECISION_REQUIRED`, `ESCALATION_REQUIRED`, `PANEL_DISSENT`에서는 자동으로 진행하지 않는다. 사용자 선택을 받은 뒤 아래 명령으로 재개하거나 위험 수용을 기록한다.
+9. 매 명령의 `state`를 확인한다. `USER_DECISION_REQUIRED`, `ESCALATION_REQUIRED`, `PANEL_DISSENT`에서는 자동으로 진행하지 않는다. `decision_owner: USER`인 이슈는 작성자가 대신 정하지 않는다. 사용자 선택을 받은 뒤 권위 있는 결정 내용을 구조화 JSON으로 기록해 재개하거나 위험 수용을 기록한다.
+
+   ```json
+   {
+     "action": "REVISE",
+     "audit_note": "사용자와 기본 경로를 확정했다.",
+     "authoritative_decisions": [
+       {
+         "decision": "기본 입력은 현재 디렉터리의 .env이다.",
+         "supersedes": []
+       }
+     ]
+   }
+   ```
 
    ```bash
    python3 .claude/skills/ensemble/scripts/review.py resolve-user-decision \
-     --run <run> --action REVISE --note-file <user-decision.txt>
+     --run <run> --decision-file <user-decision.json>
    python3 .claude/skills/ensemble/scripts/review.py accept-risk \
      --run <run> --issue <id> --round <N> --note-file <note>
    ```
 
-   문서를 고치지 않고 검토만 이어가려면 `--action CONTINUE`를 사용한다.
+   문서를 고치지 않고 검토만 이어가려면 JSON의 `action`을 `CONTINUE`로 둔다.
+   기록된 결정은 `01-input/user-decisions.json`에 투영되어 다음 일반·최종·패널
+   검토의 권위 입력으로 전달된다. 기존 결정을 바꾸면 해당 ID를 `supersedes`에
+   넣는다. 이 파일을 직접 수정하거나 작성자 판단을 `source: USER`로 기록하지
+   않는다. 직접 수정은 다음 모델 호출 전에 무결성 오류로 거부된다.
+   `accept-risk`는 사용자가 명시적으로 위험 수용을 선택했고 해당 이슈가
+   `pending_user_issue_ids`에 있을 때만 실행한다.
 
 ## 오류 처리
 
 - `SCHEMA_ERROR`(형식 오류), `SEMANTIC_VALIDATION_ERROR`(내용 규칙 오류), `INFRA_ERROR`(실행 환경 오류)를 구분해 보고한다.
-- 최대 반복 횟수에 도달하면 승인하지 않고 `ITERATION_LIMIT_REACHED`로 끝낸다.
+- 일반 검토, 최종 독립 검토, 전체 provider 호출 한도를 각각 센다. 어느 한도든
+  다음 필수 단계를 수행할 수 없으면 승인하지 않고 `ITERATION_LIMIT_REACHED`로 끝낸다.
+- 기본 한도는 일반 검토 5회, 최종 독립 검토 2회다.
 - 최종 독립 검토 원본은 수정하지 않는다. 위험 수용 대조 결과는 `final-reconciliation.json`에서 확인한다.
 - 전체 흐름은 `timeline.md`에서 확인한다. 세부 근거는 `decisions.md`, `reviews/`, `issue-registry.json`을 기준으로 한다.
 - 실행 중 Ensemble 코드가 바뀌어 `RUN_TAINTED`가 되면 해당 실행을 버리고 새로 시작한다.

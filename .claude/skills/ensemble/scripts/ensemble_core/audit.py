@@ -9,6 +9,7 @@ from .errors import InputError, SemanticValidationError, StateError
 from .io_utils import atomic_write_json, read_json
 from .providers import ProviderResult, run_codex
 from .registry import load_registry, write_reviewer_projection
+from .state_machine import record_provider_call, transition_state
 from .validation import validate_against_schema
 from . import layout
 
@@ -68,7 +69,11 @@ def apply_audit(run_dir: Path, *, round_number: int, payload: dict[str, Any]) ->
         )
         manifest["pending_panel_issue_ids"] = candidates
         if not candidates:
-            manifest["state"] = "DRAFT_READY"
+            transition_state(
+                manifest,
+                "DRAFT_READY",
+                reason="issue audit cleared reviewer-storm escalation",
+            )
             manifest["escalation_signals"] = []
         atomic_write_json(layout.manifest(run_dir), manifest)
     return {"audit": str(output), "counts": counts}
@@ -115,4 +120,11 @@ def run_issue_audit(
             model=model,
             timeout=timeout,
         )
+    record_provider_call(
+        run_dir,
+        provider="codex",
+        operation="issue-audit",
+        round_number=round_number,
+        result=result,
+    )
     return result, apply_audit(run_dir, round_number=round_number, payload=result.payload)

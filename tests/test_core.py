@@ -16,7 +16,7 @@ from ensemble_core.bundle import isolated_bundle, prepare_review_session_bundle
 from ensemble_core.audit import apply_audit
 from ensemble_core.cards import build_feedback_cards, build_panel_card
 from ensemble_core.convergence import refresh_author_dispositions, reproducibility_metrics
-from ensemble_core.errors import InputError, SchemaError, SecurityError, SemanticValidationError, StateError
+from ensemble_core.errors import InfraError, InputError, SchemaError, SecurityError, SemanticValidationError, StateError
 from ensemble_core.hashing import canonical_issue_key, parse_sections, refs_changed, section_hashes
 from ensemble_core.history import write_timeline
 from ensemble_core import layout
@@ -26,20 +26,31 @@ from ensemble_core.providers import ProviderResult
 from ensemble_core.registry import accept_risk, load_registry, record_author_decision
 from ensemble_core.report import finalize
 from ensemble_core.state_machine import (
+    assert_accept_risk_ready,
+    assert_final_blind_ready,
     assert_run_can_advance,
+    assert_final_blind_budget,
     assert_source_unchanged,
     initialize_run,
     load_codex_review_session,
     record_codex_review_session,
+    record_provider_call,
+    record_repair_plan,
     register_draft,
     resolve_user_decision,
     verified_request_hash,
 )
 from ensemble_core.validation import validate_review_schema
-from ensemble_core.workflow import ingest_review, run_review
+from ensemble_core.workflow import ingest_review, promote_final_findings, run_review
 
 
-def issue(*, issue_id: str | None = None, severity: int = 4, response: str | None = None) -> dict[str, object]:
+def issue(
+    *,
+    issue_id: str | None = None,
+    severity: int = 4,
+    response: str | None = None,
+    decision_owner: str = "AUTHOR",
+) -> dict[str, object]:
     return {
         "id": issue_id,
         "criterion_id": "AC-02",
@@ -49,6 +60,7 @@ def issue(*, issue_id: str | None = None, severity: int = 4, response: str | Non
         "violation_evidence": "`오류 흐름` 절에 실패 상태가 없다.",
         "implementation_consequence": "구현자가 실패 상태를 임의로 결정해야 한다.",
         "required_change": "실패 상태와 복구 흐름을 추가한다.",
+        "decision_owner": decision_owner,
         "severity": severity,
         "confidence": 0.8,
         "basis": "DOCUMENT_INTERNAL",
@@ -64,6 +76,7 @@ def review(
     blockers: list[dict[str, object]] | None = None,
     resolved: list[dict[str, object]] | None = None,
     verdict: str | None = None,
+    questions: list[str] | None = None,
 ) -> dict[str, object]:
     blockers = blockers or []
     resolved = resolved or []
@@ -72,7 +85,7 @@ def review(
         "summary": "구조화 리뷰",
         "blocking_issues": blockers,
         "resolved_issues": resolved,
-        "questions_for_user": [],
+        "questions_for_user": questions or [],
         "nonblocking_risks": [],
     }
 
@@ -85,6 +98,8 @@ class RunCase(unittest.TestCase):
         self.patches = [
             patch("ensemble_core.state_machine.RUNS_ROOT", self.runs),
             patch("ensemble_core.io_utils.RUNS_ROOT", self.runs),
+            # 테스트가 사용자 홈의 실제 세션 기록을 읽지 않게 한다.
+            patch("ensemble_core.config.CLAUDE_TRANSCRIPT_ROOT", self.root / "transcripts"),
         ]
         for item in self.patches:
             item.start()
@@ -408,6 +423,96 @@ class RegistryAndWorkflowTests(RunCase):
         self.assertEqual(resolved["from_state"], "USER_DECISION_REQUIRED")
         self.assertEqual(assert_run_can_advance(self.run, "review")["state"], "DRAFT_READY")
 
+    def test_user_owned_issue_pauses_for_an_authoritative_decision(self) -> None:
+        result = ingest_review(
+            self.run,
+            review=review(
+                blockers=[issue(decision_owner="USER")],
+                verdict="USER_DECISION_REQUIRED",
+                questions=["예보 기반으로 제품 범위를 줄일까요?"],
+            ),
+            review_round=1,
+        )
+        issue_id = result["stats"]["new_issue_ids"][0]
+        manifest = read_json(layout.manifest(self.run))
+        self.assertEqual(manifest["state"], "USER_DECISION_REQUIRED")
+        self.assertEqual(manifest["pending_user_issue_ids"], [issue_id])
+        self.assertEqual(
+            assert_accept_risk_ready(self.run, issue_id)["state"],
+            "USER_DECISION_REQUIRED",
+        )
+
+    def test_user_owned_issue_cannot_be_returned_as_an_author_fix(self) -> None:
+        with self.assertRaises(SemanticValidationError):
+            ingest_review(
+                self.run,
+                review=review(blockers=[issue(decision_owner="USER")]),
+                review_round=1,
+            )
+
+    def test_repeated_failed_fix_requires_a_structural_repair_plan(self) -> None:
+        issue_id = self.first_issue()
+        workspace = layout.review_sessions_dir(self.run) / "failed-fix"
+        workspace.mkdir(parents=True)
+        record_codex_review_session(
+            self.run,
+            session_id="session-before-failed-fix",
+            review_round=1,
+            workspace=workspace,
+        )
+        for round_number in (1, 2):
+            record_author_decision(
+                self.run,
+                issue_id=issue_id,
+                round_number=round_number,
+                disposition="ACCEPT",
+                author_severity=4,
+                claim="수정 필요",
+                evidence_ref="오류 흐름",
+                requested_disposition="MODIFY",
+                argument="타당함",
+                action="수정",
+            )
+            refresh_author_dispositions(self.run, round_number)
+            if round_number == 1:
+                draft1 = self.root / "failed-fix-draft-1.md"
+                draft1.write_text(
+                    "# 스펙\n\n## 오류 흐름\n\n첫 번째 수정\n",
+                    encoding="utf-8",
+                )
+                register_draft(self.run, draft1, 1)
+                ingest_review(
+                    self.run,
+                    review=review(blockers=[issue(issue_id=issue_id)]),
+                    review_round=2,
+                )
+
+        manifest = read_json(layout.manifest(self.run))
+        self.assertEqual(manifest["repair_plan_required_issue_ids"], [issue_id])
+        self.assertIsNone(manifest["codex_review_session"])
+        blocked = self.root / "blocked-draft.md"
+        blocked.write_text("# 스펙\n\n## 오류 흐름\n\n두 번째 수정\n", encoding="utf-8")
+        with self.assertRaises(StateError):
+            register_draft(self.run, blocked, 2)
+
+        record_repair_plan(
+            self.run,
+            issue_id=issue_id,
+            round_number=2,
+            plan={
+                "root_cause": "실패 상태를 문장만 바꾸고 상태 모델에 넣지 않았다.",
+                "invariant": "모든 실패 상태에는 복구 전이가 하나 이상 있어야 한다.",
+                "counterexample": "저장 실패 뒤 재시도 경로가 없다.",
+                "state_model": "READY -> SAVING -> FAILED -> RETRYING",
+                "verification_steps": ["저장 실패를 주입한다.", "재시도 후 성공을 확인한다."],
+            },
+        )
+        self.assertEqual(
+            read_json(layout.manifest(self.run))["repair_plan_required_issue_ids"],
+            [],
+        )
+        register_draft(self.run, blocked, 2)
+
     def test_reviewer_storm_pauses_before_another_draft_or_review(self) -> None:
         previous_id = self.first_issue()
         record_author_decision(
@@ -536,6 +641,28 @@ class AcceptedRiskTests(RunCase):
         self.assertEqual(stored, raw)
         self.assertTrue(result["passed"])
 
+    def test_final_promotion_resets_reviewer_session_without_using_review_budget(self) -> None:
+        ingest_review(self.run, review=review(), review_round=1)
+        workspace = layout.review_sessions_dir(self.run) / "test"
+        workspace.mkdir(parents=True)
+        record_codex_review_session(
+            self.run,
+            session_id="session-before-promotion",
+            review_round=1,
+            workspace=workspace,
+        )
+        save_final_assessment(
+            self.run,
+            draft_path=layout.draft(self.run, 0),
+            raw_review=review(blockers=[issue()]),
+        )
+        promote_final_findings(self.run)
+        current = read_json(layout.manifest(self.run))
+        self.assertEqual(current["counters"]["iterative_reviews"], 1)
+        self.assertEqual(current["counters"]["promotions"], 1)
+        self.assertIsNone(current["codex_review_session"])
+        self.assertEqual(current["review_session_policy"]["reset_count"], 1)
+
 
 class BundleAndReportTests(RunCase):
     def test_manifest_uses_agy_panel_provider(self) -> None:
@@ -545,13 +672,22 @@ class BundleAndReportTests(RunCase):
         self.assertEqual(models["agy"]["requested"], "gemini-3.6-flash-high")
         self.assertEqual(models["agy"]["requested_reasoning_effort"], "high")
 
+    def test_default_review_budgets_are_bounded(self) -> None:
+        manifest = read_json(layout.manifest(self.run))
+        self.assertEqual(manifest["limits"]["iterative_reviews"], 5)
+        self.assertEqual(manifest["limits"]["final_blind_attempts"], 2)
+        self.assertEqual(manifest["review_session_policy"]["max_rounds_per_session"], 3)
+
     def test_final_bundle_contains_only_blind_inputs(self) -> None:
         with isolated_bundle(
             self.run,
             mode="final",
             draft_path=layout.draft(self.run, 0),
         ) as bundle:
-            self.assertEqual({path.name for path in bundle.iterdir()}, {"request.md", "rubric.md", "draft.md"})
+            self.assertEqual(
+                {path.name for path in bundle.iterdir()},
+                {"request.md", "rubric.md", "user-decisions.json", "draft.md"},
+            )
 
     def test_auto_finalize_converges_after_clean_final(self) -> None:
         ingest_review(self.run, review=review(), review_round=1)
@@ -563,6 +699,99 @@ class BundleAndReportTests(RunCase):
         result = finalize(self.run, status="auto")
         self.assertEqual(result["status"], "CONVERGED")
         self.assertTrue(layout.final(self.run).exists())
+        self.assertEqual(
+            layout.final(self.run).read_text(encoding="utf-8").strip(),
+            layout.draft(self.run, 0).read_text(encoding="utf-8").strip(),
+        )
+        self.assertNotIn("ensemble-status", layout.final(self.run).read_text(encoding="utf-8"))
+
+    def test_final_blind_requires_current_general_review_approval(self) -> None:
+        with self.assertRaises(StateError):
+            assert_final_blind_ready(self.run)
+        ingest_review(self.run, review=review(), review_round=1)
+        self.assertEqual(assert_final_blind_ready(self.run)["state"], "APPROVED")
+
+    def test_final_blind_cannot_repeat_on_the_same_draft(self) -> None:
+        ingest_review(self.run, review=review(), review_round=1)
+        save_final_assessment(
+            self.run,
+            draft_path=layout.draft(self.run, 0),
+            raw_review=review(),
+        )
+        with self.assertRaises(StateError):
+            assert_final_blind_ready(self.run)
+
+    def test_authoritative_user_decisions_are_projected_for_reviewers(self) -> None:
+        current = read_json(layout.manifest(self.run))
+        current["state"] = "USER_DECISION_REQUIRED"
+        atomic_write_json(layout.manifest(self.run), current)
+        event = resolve_user_decision(
+            self.run,
+            action="REVISE",
+            note="기본 경로를 확정",
+            authoritative_decisions=[
+                {"decision": "기본 입력은 현재 디렉터리의 .env이다.", "supersedes": []}
+            ],
+        )
+        projection = read_json(layout.user_decisions(self.run))
+        self.assertEqual(event["authoritative_decision_ids"], ["UD-001"])
+        self.assertEqual(projection["decisions"][0]["source"], "USER")
+        with isolated_bundle(
+            self.run,
+            mode="final",
+            draft_path=layout.draft(self.run, 0),
+        ) as bundle:
+            self.assertEqual(
+                read_json(bundle / "user-decisions.json")["decisions"][0]["decision_id"],
+                "UD-001",
+            )
+
+    def test_direct_user_decision_file_edit_is_rejected_before_review(self) -> None:
+        projection = read_json(layout.user_decisions(self.run))
+        projection["decisions"].append(
+            {
+                "decision_id": "UD-001",
+                "source": "USER",
+                "decision": "작성자가 직접 추가한 결정",
+                "supersedes": [],
+                "active": True,
+                "recorded_at": "2026-07-23T00:00:00Z",
+            }
+        )
+        atomic_write_json(layout.user_decisions(self.run), projection)
+        with self.assertRaises(StateError):
+            with isolated_bundle(
+                self.run,
+                mode="final",
+                draft_path=layout.draft(self.run, 0),
+            ):
+                pass
+
+    def test_benchmark_run_cannot_resume_after_user_decision_state(self) -> None:
+        current = read_json(layout.manifest(self.run))
+        current["state"] = "USER_DECISION_REQUIRED"
+        current["benchmark"] = {
+            "benchmark_run_id": "bench-1",
+            "case_id": "case-1",
+            "case_revision_hash": "h",
+            "suite": "smoke",
+            "repeat_index": 1,
+        }
+        atomic_write_json(layout.manifest(self.run), current)
+        with self.assertRaises(StateError) as raised:
+            resolve_user_decision(self.run, action="CONTINUE", note="계속")
+        self.assertTrue(raised.exception.details["benchmark_case_completed"])
+
+    def test_final_blind_attempt_budget_is_independent(self) -> None:
+        for _ in range(2):
+            save_final_assessment(
+                self.run,
+                draft_path=layout.draft(self.run, 0),
+                raw_review=review(),
+            )
+        with self.assertRaises(StateError) as raised:
+            assert_final_blind_budget(self.run)
+        self.assertEqual(raised.exception.details["limit_kind"], "FINAL_BLIND_ATTEMPTS")
 
     def test_run_ids_are_unique(self) -> None:
         second = initialize_run("오류 처리 문서", allow_reuse=True)
@@ -618,6 +847,7 @@ class ProviderCommandTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            (root / "issue.json").write_text('{"issue":"embedded"}\n', encoding="utf-8")
             schema = root / "panel.schema.json"
             schema.write_text(
                 (
@@ -672,11 +902,63 @@ class ProviderCommandTests(unittest.TestCase):
         self.assertEqual(command[command.index("--mode") + 1], "plan")
         self.assertIn("--sandbox", command)
         self.assertNotIn("--dangerously-skip-permissions", command)
-        self.assertIn("Return JSON matching this schema exactly", command[command.index("-p") + 1])
+        inline_prompt = command[command.index("-p") + 1]
+        self.assertIn("Return JSON matching this schema exactly", inline_prompt)
+        self.assertIn('{"issue":"embedded"}', inline_prompt)
+        self.assertIn("Do not use tools or commands", inline_prompt)
         self.assertEqual(captured["cwd"], root)
         self.assertIsNone(captured["input"])
         self.assertEqual(result.payload, payload)
         self.assertEqual(result.reasoning_effort, "high")
+        self.assertEqual([item["name"] for item in result.input_manifest], ["issue.json"])
+
+    def test_agy_permission_denial_fails_without_repeating(self) -> None:
+        from ensemble_core.providers import run_agy
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            schema = root / "schema.json"
+            schema.write_text(
+                json.dumps(
+                    {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["ok"],
+                        "properties": {"ok": {"type": "boolean"}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            calls = 0
+
+            def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
+                nonlocal calls
+                if "--version" in command:
+                    return SimpleNamespace(returncode=0, stdout="1.1.5", stderr="")
+                calls += 1
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="",
+                    stderr=(
+                        'jetski: no output produced — a tool required the "command" '
+                        "permission that headless mode cannot prompt for, so it was auto-denied."
+                    ),
+                )
+
+            with patch("ensemble_core.providers.shutil.which", return_value="/fake/agy"), patch(
+                "ensemble_core.providers.subprocess.run", side_effect=fake_run
+            ):
+                with self.assertRaises(InfraError) as raised:
+                    run_agy(
+                        bundle_dir=root,
+                        prompt="PROMPT",
+                        schema_path=schema,
+                        schema_kind="test",
+                        model="m",
+                        retries=2,
+                    )
+        self.assertEqual(calls, 1)
+        self.assertEqual(raised.exception.details["last_error"]["kind"], "permission_denied")
 
     def test_codex_invocation_uses_isolation_flags_and_stdin(self) -> None:
         from ensemble_core.providers import run_codex
@@ -727,6 +1009,113 @@ class ProviderCommandTests(unittest.TestCase):
             self.assertEqual(result.payload, payload)
             self.assertIn("model_reasoning_effort=high", command)
             self.assertEqual(result.reasoning_effort, "high")
+
+    def test_failed_codex_call_keeps_usage_from_every_attempt(self) -> None:
+        from ensemble_core.providers import run_codex
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            schema = root / "schema.json"
+            schema.write_text(
+                json.dumps(
+                    {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["ok"],
+                        "properties": {"ok": {"type": "boolean"}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            attempt = 0
+
+            def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
+                nonlocal attempt
+                if "--version" in command:
+                    return SimpleNamespace(returncode=0, stdout="codex-cli test", stderr="")
+                attempt += 1
+                event = {
+                    "type": "turn.completed",
+                    "usage": {"input_tokens": attempt * 10, "output_tokens": attempt},
+                }
+                return SimpleNamespace(
+                    returncode=1,
+                    stdout=json.dumps(event),
+                    stderr="failed",
+                )
+
+            with patch("ensemble_core.providers.shutil.which", return_value="/fake/codex"), patch(
+                "ensemble_core.providers.subprocess.run", side_effect=fake_run
+            ):
+                with self.assertRaises(InfraError) as raised:
+                    run_codex(
+                        bundle_dir=root,
+                        prompt="PROMPT",
+                        schema_path=schema,
+                        schema_kind="test",
+                        model="m",
+                        retries=1,
+                    )
+        self.assertEqual(raised.exception.details["usage"]["input_tokens"], 30)
+        self.assertEqual(raised.exception.details["usage"]["output_tokens"], 3)
+        self.assertEqual(raised.exception.details["attempts_reported"], 2)
+
+    def test_failed_codex_call_folds_cumulative_usage_for_same_session(self) -> None:
+        from ensemble_core.providers import run_codex
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            schema = root / "schema.json"
+            schema.write_text(
+                json.dumps(
+                    {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["ok"],
+                        "properties": {"ok": {"type": "boolean"}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            attempt = 0
+
+            def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
+                nonlocal attempt
+                if "--version" in command:
+                    return SimpleNamespace(returncode=0, stdout="codex-cli test", stderr="")
+                attempt += 1
+                stdout = "\n".join(
+                    [
+                        json.dumps({"type": "thread.started", "thread_id": "session-1"}),
+                        json.dumps(
+                            {
+                                "type": "turn.completed",
+                                "usage": {
+                                    "input_tokens": attempt * 10,
+                                    "output_tokens": attempt,
+                                },
+                            }
+                        ),
+                    ]
+                )
+                return SimpleNamespace(returncode=1, stdout=stdout, stderr="failed")
+
+            with patch("ensemble_core.providers.shutil.which", return_value="/fake/codex"), patch(
+                "ensemble_core.providers.subprocess.run", side_effect=fake_run
+            ):
+                with self.assertRaises(InfraError) as raised:
+                    run_codex(
+                        bundle_dir=root,
+                        prompt="PROMPT",
+                        schema_path=schema,
+                        schema_kind="test",
+                        model="m",
+                        retries=1,
+                        persist_session=True,
+                    )
+        self.assertEqual(raised.exception.details["usage"]["input_tokens"], 20)
+        self.assertEqual(raised.exception.details["usage"]["output_tokens"], 2)
+        self.assertEqual(len(raised.exception.details["usage_snapshots"]), 1)
 
     def test_codex_review_session_is_created_then_resumed(self) -> None:
         from ensemble_core.providers import run_codex
@@ -845,6 +1234,48 @@ class ProviderCommandTests(unittest.TestCase):
 
 
 class ReviewSessionTests(RunCase):
+    def test_usage_total_adds_only_same_session_increase(self) -> None:
+        def result(input_tokens: int, output_tokens: int, *, resumed: bool) -> ProviderResult:
+            usage = {"input_tokens": input_tokens, "output_tokens": output_tokens}
+            return ProviderResult(
+                payload={},
+                stdout="",
+                stderr="",
+                attempts=1,
+                executable="/fake/codex",
+                version="codex-cli test",
+                model="test-model",
+                session_id="session-123",
+                session_resumed=resumed,
+                usage=usage,
+                usage_snapshots=({"session_id": "session-123", "usage": usage},),
+                attempts_reported=1,
+            )
+
+        record_provider_call(
+            self.run,
+            provider="codex",
+            operation="review",
+            result=result(100, 10, resumed=False),
+            round_number=1,
+        )
+        record_provider_call(
+            self.run,
+            provider="codex",
+            operation="review",
+            result=result(250, 25, resumed=True),
+            round_number=2,
+        )
+
+        manifest = read_json(layout.manifest(self.run))
+        self.assertEqual(manifest["usage"]["codex"]["input_tokens"], 250)
+        self.assertEqual(manifest["usage"]["codex"]["output_tokens"], 25)
+        self.assertEqual(
+            manifest["provider_calls"][1]["usage_attributed"]["input_tokens"],
+            150,
+        )
+        self.assertEqual(manifest["provider_calls"][1]["usage"]["input_tokens"], 250)
+
     def test_review_session_bundle_rejects_allowed_name_symlink(self) -> None:
         request_hash = verified_request_hash(self.run)
         workspace = layout.review_session(self.run, request_hash)
@@ -923,6 +1354,47 @@ class ReviewSessionTests(RunCase):
         manifest = read_json(layout.manifest(self.run))
         self.assertEqual(manifest["codex_review_session"]["last_review_round"], 2)
         self.assertEqual(manifest["codex_review_session"]["request_hash"], verified_request_hash(self.run))
+
+    def test_review_session_resets_after_three_rounds(self) -> None:
+        received_session_ids: list[str | None] = []
+        created_sessions = iter(("session-1", "session-2"))
+
+        def fake_codex(**kwargs: object) -> ProviderResult:
+            prior = kwargs.get("session_id")
+            prior_session_id = prior if isinstance(prior, str) else None
+            received_session_ids.append(prior_session_id)
+            session_id = prior_session_id or next(created_sessions)
+            return ProviderResult(
+                payload=review(),
+                stdout="",
+                stderr="",
+                attempts=1,
+                executable="/fake/codex",
+                version="codex-cli test",
+                model="test-model",
+                reasoning_effort="high",
+                session_id=session_id,
+                session_resumed=prior_session_id is not None,
+            )
+
+        with patch("ensemble_core.workflow.run_codex", side_effect=fake_codex):
+            for review_round in range(1, 5):
+                run_review(
+                    self.run,
+                    review_round=review_round,
+                    draft_round=0,
+                    model="test-model",
+                    timeout=30,
+                )
+
+        self.assertEqual(received_session_ids, [None, "session-1", "session-1", None])
+        manifest = read_json(layout.manifest(self.run))
+        self.assertEqual(manifest["codex_review_session"]["session_id"], "session-2")
+        self.assertEqual(manifest["review_session_policy"]["reset_count"], 1)
+        self.assertEqual(
+            manifest["review_session_policy"]["last_reset_reason"],
+            "PERIODIC_ROUND_LIMIT",
+        )
 
 
 class LayoutTests(RunCase):

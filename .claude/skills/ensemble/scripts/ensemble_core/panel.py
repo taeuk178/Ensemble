@@ -11,7 +11,7 @@ from .errors import InfraError, InputError, StateError
 from .io_utils import atomic_write_json, atomic_write_text, read_json
 from .providers import run_agy, run_codex
 from .registry import load_registry, write_reviewer_projection
-from .state_machine import record_provider_call
+from .state_machine import assert_provider_call_budget, record_provider_call, transition_state
 from . import layout
 
 
@@ -40,6 +40,7 @@ def run_panel(
     panel_count = int(manifest.get("panel_call_count", 0))
     if panel_count >= int(manifest["limits"]["panel_calls"]):
         raise StateError("Panel call limit reached")
+    assert_provider_call_budget(run_dir, needed=4)
     draft_round = int(manifest.get("current_round", 0))
     draft_path = layout.draft(run_dir, draft_round)
     panel_dir = layout.panel_issue(run_dir, issue_id)
@@ -87,7 +88,11 @@ def run_panel(
         except InfraError:
             manifest = read_json(layout.manifest(run_dir))
             issue["status"] = "BILATERAL_DEADLOCK"
-            manifest["state"] = "USER_DECISION_REQUIRED"
+            transition_state(
+                manifest,
+                "USER_DECISION_REQUIRED",
+                reason=f"panel provider failed for {issue_id}",
+            )
             pending = set(manifest.get("pending_user_issue_ids", []))
             pending.add(issue_id)
             manifest["pending_user_issue_ids"] = sorted(pending)
@@ -150,7 +155,11 @@ def run_panel(
     else:
         issue["status"] = "PANEL_DISSENT"
         issue["gating"] = True
-        manifest["state"] = "USER_DECISION_REQUIRED"
+        transition_state(
+            manifest,
+            "USER_DECISION_REQUIRED",
+            reason=f"panel dissent for {issue_id}",
+        )
         pending = set(manifest.get("pending_user_issue_ids", []))
         pending.add(issue_id)
         manifest["pending_user_issue_ids"] = sorted(pending)
@@ -164,9 +173,17 @@ def run_panel(
     manifest["pending_panel_issue_ids"] = sorted(pending_panel)
     if outcome != "PANEL_DISSENT":
         if pending_panel:
-            manifest["state"] = "ESCALATION_REQUIRED"
+            transition_state(
+                manifest,
+                "ESCALATION_REQUIRED",
+                reason="additional panel issue remains",
+            )
         else:
-            manifest["state"] = "NEEDS_REVISION" if outcome == "REVISION_REQUIRED" else "DRAFT_READY"
+            transition_state(
+                manifest,
+                "NEEDS_REVISION" if outcome == "REVISION_REQUIRED" else "DRAFT_READY",
+                reason=f"panel outcome {outcome}",
+            )
             manifest["escalation_signals"] = []
     issue.setdefault("panel_history", []).append(
         {

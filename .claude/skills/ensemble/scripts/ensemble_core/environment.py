@@ -63,12 +63,20 @@ def _git_output(*args: str) -> str | None:
     return completed.stdout.strip()
 
 
-def environment_snapshot() -> dict[str, Any]:
+def git_commit() -> str | None:
+    return _git_output("rev-parse", "HEAD")
+
+
+def git_dirty() -> bool | None:
     status = _git_output("status", "--short", "--untracked-files=no")
+    return bool(status) if status is not None else None
+
+
+def environment_snapshot() -> dict[str, Any]:
     return {
         "ensemble_source_hash": ensemble_source_hash(),
-        "git_commit": _git_output("rev-parse", "HEAD"),
-        "git_dirty": bool(status) if status is not None else None,
+        "git_commit": git_commit(),
+        "git_dirty": git_dirty(),
         "codex": command_info("codex"),
         "agy": command_info("agy"),
     }
